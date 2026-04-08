@@ -1,26 +1,48 @@
 const mongoose = require('mongoose');
 
+const ATLAS_PREFIX = 'mongodb+srv://';
+const LOCAL_PREFIX = 'mongodb://';
+
 /**
- * Connect to MongoDB Atlas.
- *
- * The MONGODB_URI must be a mongodb+srv:// connection string from Atlas.
- * Example:
- *   mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/interview_bot?retryWrites=true&w=majority
+ * Validate the connection string before hitting DNS.
+ * Throws a human-readable error for common mistakes.
  */
-async function connectDB() {
-  const uri = process.env.MONGODB_URI;
-  if (!uri) {
-    throw new Error('MONGODB_URI is not defined. Set it to your MongoDB Atlas connection string.');
+function validateUri(uri) {
+  if (!uri || !uri.trim()) {
+    throw new Error(
+      '[db] MONGODB_URI is empty.\n' +
+      '  → Copy the connection string from Atlas: Cluster → Connect → Drivers\n' +
+      '  → Paste it into backend/.env as MONGODB_URI=mongodb+srv://...'
+    );
   }
 
-  mongoose.connection.on('connected',    () => console.log('[db] MongoDB Atlas connected'));
-  mongoose.connection.on('disconnected', () => console.warn('[db] MongoDB Atlas disconnected'));
+  const hasPlaceholder = /<[^>]+>/.test(uri);
+  if (hasPlaceholder) {
+    throw new Error(
+      '[db] MONGODB_URI still contains placeholder text (e.g. <username>).\n' +
+      '  → Replace every <...> token with your real Atlas credentials.'
+    );
+  }
+
+  if (!uri.startsWith(ATLAS_PREFIX) && !uri.startsWith(LOCAL_PREFIX)) {
+    throw new Error(
+      `[db] MONGODB_URI looks wrong — got: "${uri.slice(0, 40)}"\n` +
+      '  → It must start with  mongodb+srv://  (Atlas) or  mongodb://  (local).'
+    );
+  }
+}
+
+async function connectDB() {
+  const uri = process.env.MONGODB_URI;
+
+  validateUri(uri);
+
+  mongoose.connection.on('connected',    () => console.log('[db] MongoDB connected ✓'));
+  mongoose.connection.on('disconnected', () => console.warn('[db] MongoDB disconnected'));
   mongoose.connection.on('error',        (err) => console.error('[db] MongoDB error:', err.message));
 
   await mongoose.connect(uri, {
-    // Atlas-recommended settings
-    retryWrites:       true,
-    serverSelectionTimeoutMS: 10_000,   // fail fast if Atlas unreachable
+    serverSelectionTimeoutMS: 10_000,
     socketTimeoutMS:          45_000,
     maxPoolSize:              10,
   });
