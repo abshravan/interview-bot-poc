@@ -1,0 +1,47 @@
+version: '3.9'
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: interview_mongo
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo_data:/data/db
+
+  resume-parser:
+    build: ./resume-parser
+    container_name: interview_parser
+    ports:
+      - '8000:8000'
+    environment:
+      - PORT=8000
+
+  backend:
+    build: ./backend
+    container_name: interview_backend
+    ports:
+      - '4000:4000'
+    environment:
+      - PORT=4000
+      - MONGODB_URI=mongodb://mongo:27017/interview_bot
+      - RESUME_PARSER_URL=http://resume-parser:8000
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - FRONTEND_URL=http://localhost:3000
+    depends_on:
+      - mongo
+      - resume-parser
+
+  frontend:
+    build: ./frontend
+    container_name: interview_frontend
+    ports:
+      - '3000:3000'
+    environment:
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
+      - NEXT_PUBLIC_WS_URL=ws://localhost:4000
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:

@@ -1,0 +1,25 @@
+{
+  "name": "interview-bot-backend",
+  "version": "1.0.0",
+  "description": "Backend for AI interview prep app",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.4.0",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^10.0.0",
+    "ws": "^8.17.1",
+    "axios": "^1.7.2",
+    "form-data": "^4.0.0",
+    "@google/generative-ai": "^0.15.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.3"
+  }
+}
