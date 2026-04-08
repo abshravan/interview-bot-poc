@@ -1,48 +1,132 @@
-*, *::before, *::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-inter: 'Inter', system-ui, sans-serif;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: #030303;
+    color: #e8e8e8;
+    font-family: var(--font-inter);
+    min-height: 100vh;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar        { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track  { background: #0D0D0D; }
+  ::-webkit-scrollbar-thumb  { background: #2A2A2A; border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3A3A3A; }
+
+  /* Selection */
+  ::selection {
+    background: rgba(200, 200, 200, 0.2);
+    color: #ffffff;
+  }
 }
 
-:root {
-  --bg: #0f1117;
-  --surface: #1a1d27;
-  --border: #2e3148;
-  --accent: #6c63ff;
-  --accent-hover: #8b84ff;
-  --text: #e8eaf6;
-  --muted: #8891b0;
-  --success: #4caf89;
-  --error: #ef5350;
-  --warning: #ffb347;
+@layer components {
+  /* Star logo mark - three-pointed star inspired by Mercedes */
+  .star-mark {
+    position: relative;
+    width: 48px;
+    height: 48px;
+  }
+
+  /* Shimmer text effect */
+  .text-shimmer {
+    background: linear-gradient(90deg, #888 0%, #E8E8E8 40%, #E8E8E8 60%, #888 100%);
+    background-size: 800px 100%;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: shimmer 3s linear infinite;
+  }
+
+  /* Gold shimmer text */
+  .text-gold-shimmer {
+    background: linear-gradient(90deg, #8A6E2A 0%, #D4B870 40%, #D4B870 60%, #8A6E2A 100%);
+    background-size: 800px 100%;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: shimmer 3s linear infinite;
+  }
+
+  /* Audio visualizer bars */
+  .audio-bar {
+    width: 3px;
+    border-radius: 2px;
+    background: linear-gradient(to top, #666, #D4D4D4);
+    transform-origin: bottom center;
+  }
+
+  /* Glass panel */
+  .glass {
+    background: rgba(20, 20, 20, 0.8);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+  }
+
+  /* Hover card effect */
+  .hover-lift {
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+  }
+  .hover-lift:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 0 0 1px rgba(200,200,200,0.15), 0 12px 40px rgba(0,0,0,0.8);
+  }
+
+  /* Benz divider */
+  .benz-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, rgba(200,200,200,0.2) 30%, rgba(200,200,200,0.2) 70%, transparent 100%);
+  }
+
+  /* Score ring animation */
+  .score-ring-progress {
+    transition: stroke-dashoffset 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* Animated gradient border */
+  .gradient-border {
+    position: relative;
+  }
+  .gradient-border::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    background: linear-gradient(135deg, rgba(200,200,200,0.3), transparent, rgba(200,200,200,0.1));
+    z-index: -1;
+  }
+
+  /* Step connector line */
+  .step-line {
+    width: 1px;
+    background: linear-gradient(to bottom, rgba(200,200,200,0.3), transparent);
+    flex: 1;
+    min-height: 24px;
+  }
 }
 
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  min-height: 100vh;
-}
-
-a { color: var(--accent); text-decoration: none; }
-a:hover { color: var(--accent-hover); }
-
-button {
-  cursor: pointer;
-  border: none;
-  outline: none;
-  font-family: inherit;
-}
-
-input, textarea, select {
-  font-family: inherit;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--text);
-  border-radius: 8px;
-  padding: 10px 14px;
-}
-
-input:focus, textarea:focus, select:focus {
-  outline: 2px solid var(--accent);
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 }
