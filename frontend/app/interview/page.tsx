@@ -84,17 +84,25 @@ export default function InterviewPage() {
   const [error, setError]               = useState('');
   const [feedbackLoading, setFbLoading] = useState(false);
 
-  const wsRef      = useRef<WebSocket | null>(null);
-  const recCtxRef  = useRef<AudioContext | null>(null);  // 16 kHz – mic capture
-  const playCtxRef = useRef<AudioContext | null>(null);  // 24 kHz – AI playback
-  const streamRef  = useRef<MediaStream | null>(null);
-  const queueRef   = useRef<AudioBuffer[]>([]);
-  const playingRef = useRef(false);
-  const mutedRef   = useRef(false);
-  const bottomRef  = useRef<HTMLDivElement>(null);
+  const wsRef         = useRef<WebSocket | null>(null);
+  const recCtxRef     = useRef<AudioContext | null>(null);  // 16 kHz – mic capture
+  const playCtxRef    = useRef<AudioContext | null>(null);  // 24 kHz – AI playback
+  const streamRef     = useRef<MediaStream | null>(null);
+  const queueRef      = useRef<AudioBuffer[]>([]);
+  const playingRef    = useRef(false);
+  const mutedRef      = useRef(false);
+  const aiSpeakingRef = useRef(false);   // true while AI audio is playing
+  const aiStoppedAt   = useRef(0);       // timestamp when AI last stopped speaking
+  const bottomRef     = useRef<HTMLDivElement>(null);
 
-  // Keep mutedRef current so the audio processor closure always sees the latest value
   useEffect(() => { mutedRef.current = muted; }, [muted]);
+
+  // Track AI speaking in a ref so the audio processor closure sees current value.
+  // Also record when AI stops so we can apply a hold-off before re-opening the mic.
+  useEffect(() => {
+    aiSpeakingRef.current = aiSpeaking;
+    if (!aiSpeaking) aiStoppedAt.current = Date.now();
+  }, [aiSpeaking]);
 
   const addMsg = useCallback((role: 'interviewer' | 'candidate', content: string) => {
     setMessages((prev) => [...prev, { role, content, ts: new Date() }]);
@@ -135,17 +143,31 @@ export default function InterviewPage() {
 
   const startMic = useCallback(async (ws: WebSocket) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Request browser-side acoustic echo cancellation + noise suppression
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl:  true,
+        },
+      });
       streamRef.current = stream;
 
-      // Recording context only — playback context is created in the main useEffect
       recCtxRef.current = new AudioContext({ sampleRate: 16000 });
-
       const recCtx = recCtxRef.current;
       const src    = recCtx.createMediaStreamSource(stream);
-      const proc   = recCtx.createScriptProcessor(4096, 1, 1);
+
+      // 2048 samples @ 16 kHz = 128 ms per chunk (half the previous 256 ms)
+      const proc = recCtx.createScriptProcessor(2048, 1, 1);
+      const HOLD_OFF_MS = 400; // silence after AI stops before re-opening mic
+
       proc.onaudioprocess = (e) => {
-        if (mutedRef.current || ws.readyState !== WebSocket.OPEN) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (mutedRef.current) return;
+        // Suppress mic while AI is speaking or within hold-off window
+        if (aiSpeakingRef.current) return;
+        if (Date.now() - aiStoppedAt.current < HOLD_OFF_MS) return;
+
         const f32 = e.inputBuffer.getChannelData(0);
         const i16 = new Int16Array(f32.length);
         for (let i = 0; i < f32.length; i++)

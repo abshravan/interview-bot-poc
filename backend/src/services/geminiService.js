@@ -59,7 +59,7 @@ function buildSetupPayload(role, resumeText) {
       realtimeInputConfig: {
         automaticActivityDetection: {
           prefixPaddingMs:   300,
-          silenceDurationMs: 600,
+          silenceDurationMs: 1000,  // longer window — reduces false triggers from echo
         },
       },
     },
