@@ -40,14 +40,21 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 // Middleware
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:3000')
+const allowedOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
-  .map((o) => o.trim());
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const isLocalOrigin = (origin) =>
+  /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 
 app.use(cors({
   origin(origin, cb) {
     // Allow requests with no origin (curl, Postman, server-to-server)
     if (!origin) return cb(null, true);
+    // Always allow localhost / 127.0.0.1 in development
+    if (process.env.NODE_ENV !== 'production' && isLocalOrigin(origin)) return cb(null, true);
+    // Allow explicitly listed origins
     if (allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error(`CORS: origin ${origin} not allowed`));
   },
