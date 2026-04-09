@@ -180,12 +180,14 @@ export default function InterviewPage() {
     }
   }, []);
 
+  // Guard against React 18 StrictMode double-invoke in development
+  const didConnect = useRef(false);
+
   useEffect(() => {
     if (!sessionId) { setError('No session ID.'); return; }
+    if (didConnect.current) return;
+    didConnect.current = true;
 
-    // Create playback context synchronously before the WebSocket opens so it is
-    // guaranteed to exist when the first audio chunk arrives from Gemini.
-    // 24 kHz matches Gemini Live's output sample rate.
     playCtxRef.current = new AudioContext({ sampleRate: 24000 });
 
     const ws = new WebSocket(`${WS_BASE}/ws/interview?sessionId=${sessionId}`);

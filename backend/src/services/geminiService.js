@@ -52,16 +52,6 @@ function buildSetupPayload(role, resumeText) {
       systemInstruction: {
         parts: [{ text: buildSystemPrompt(role, resumeText) }],
       },
-      // Enable speech-to-text transcriptions for both sides
-      inputAudioTranscription:  {},
-      outputAudioTranscription: {},
-      // Built-in VAD (matches Python defaults)
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          prefixPaddingMs:   300,
-          silenceDurationMs: 1000,  // longer window — reduces false triggers from echo
-        },
-      },
     },
   };
 }
@@ -198,10 +188,9 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.type === 'audio') {
-      // realtimeInput.audio format (from Python reference)
       const payload = JSON.stringify({
         realtimeInput: {
-          audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
+          mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: msg.data }],
         },
       });
       if (!setupComplete) {
