@@ -173,12 +173,38 @@ async function handleInterviewSocket(clientWs, sessionId) {
   });
 
   clientWs.on('close', () => geminiWs.close());
-  geminiWs.on('close', () => {
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
+
+  // Track whether we already fell back so we don't double-invoke mock mode
+  let fellBack = false;
+  function fallbackToMock(reason) {
+    if (fellBack) return;
+    fellBack = true;
+    console.warn(`[gemini] Falling back to mock mode — reason: ${reason}`);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      // Notify the browser so the user knows why, then start mock interview
+      clientWs.send(JSON.stringify({
+        type: 'text',
+        role: 'interviewer',
+        content: `[Demo mode — Gemini API unavailable: ${reason}] Starting mock interview.`,
+      }));
+      handleMockInterview(clientWs, sessionId);
+    }
+  }
+
+  geminiWs.on('close', (code, reasonBuf) => {
+    const reason = reasonBuf?.toString() || '(no reason)';
+    console.log(`[gemini] WS closed — code: ${code}  reason: ${reason}`);
+    if (!setupComplete) {
+      // Closed before we ever got setupComplete — Gemini rejected the connection
+      fallbackToMock(`WS closed ${code}: ${reason}`);
+    } else if (!fellBack && clientWs.readyState === WebSocket.OPEN) {
+      clientWs.close();
+    }
   });
+
   geminiWs.on('error', (err) => {
-    console.error('Gemini WS error:', err.message);
-    clientWs.close(1011, 'Gemini connection error');
+    console.error('[gemini] WS error:', err.message);
+    fallbackToMock(err.message);
   });
 }
 
