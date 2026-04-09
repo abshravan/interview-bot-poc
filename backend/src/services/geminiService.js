@@ -47,10 +47,23 @@ function buildSetupPayload(role, resumeText) {
       model: modelId,
       generationConfig: {
         responseModalities: ['AUDIO'],
-        temperature: 0.7,
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
+        },
       },
       systemInstruction: {
         parts: [{ text: buildSystemPrompt(role, resumeText) }],
+      },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+          endOfSpeechSensitivity:   'END_SENSITIVITY_LOW',
+          prefixPaddingMs:  300,
+          silenceDurationMs: 1000,
+        },
       },
     },
   };
@@ -100,10 +113,17 @@ async function handleInterviewSocket(clientWs, sessionId) {
   }
 
   // ── Gemini WS open → send setup ─────────────────────────────────────────────
+  // Helper: log + send every outgoing message to Gemini
+  function sendToGemini(payload) {
+    const str = JSON.stringify(payload);
+    console.log('[gemini] →', str.slice(0, 200));
+    geminiWs.send(str);
+  }
+
   geminiWs.on('open', () => {
     const modelId = (process.env.GEMINI_LIVE_MODEL || DEFAULT_MODEL).trim();
     console.log(`[gemini] WS open — setup for model: ${modelId}`);
-    geminiWs.send(JSON.stringify(setupPayload));
+    sendToGemini(setupPayload);
   });
 
   // ── Gemini → browser ────────────────────────────────────────────────────────
@@ -117,7 +137,9 @@ async function handleInterviewSocket(clientWs, sessionId) {
       setupComplete = true;
       console.log(`[gemini] Setup complete ✓ — flushing ${audioQueue.length} queued chunk(s)`);
       while (audioQueue.length && geminiWs.readyState === WebSocket.OPEN) {
-        geminiWs.send(audioQueue.shift());
+        const queued = audioQueue.shift();
+        console.log('[gemini] → (queued)', queued.slice(0, 200));
+        geminiWs.send(queued);
       }
       return;
     }
@@ -188,27 +210,24 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.type === 'audio') {
-      const payload = JSON.stringify({
-        realtimeInput: {
-          mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: msg.data }],
-        },
-      });
+      const audioObj = { realtimeInput: { audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' } } };
       if (!setupComplete) {
-        audioQueue.push(payload);
+        audioQueue.push(JSON.stringify(audioObj));
       } else if (geminiWs.readyState === WebSocket.OPEN) {
-        geminiWs.send(payload);
+        sendToGemini(audioObj);
       }
     }
 
     if (msg.type === 'text') {
       await appendTranscript(sessionId, 'candidate', msg.content);
-      const payload = JSON.stringify({
-        clientContent: {
-          turns: [{ role: 'user', parts: [{ text: msg.content }] }],
-          turnComplete: true,
-        },
-      });
-      if (geminiWs.readyState === WebSocket.OPEN) geminiWs.send(payload);
+      if (geminiWs.readyState === WebSocket.OPEN) {
+        sendToGemini({
+          clientContent: {
+            turns: [{ role: 'user', parts: [{ text: msg.content }] }],
+            turnComplete: true,
+          },
+        });
+      }
     }
 
     if (msg.type === 'end') geminiWs.close();
@@ -219,7 +238,9 @@ async function handleInterviewSocket(clientWs, sessionId) {
   geminiWs.on('close', (code, reasonBuf) => {
     const reason = reasonBuf?.toString() || '(no reason)';
     console.log(`[gemini] WS closed — code: ${code}  reason: ${reason}`);
-    if (!setupComplete) {
+    // Fallback on any error close (before OR after setup)
+    const isErrorClose = code !== 1000 && code !== 1001;
+    if (!setupComplete || isErrorClose) {
       fallbackToMock(`WS closed ${code}: ${reason}`);
     } else if (!fellBack && clientWs.readyState === WebSocket.OPEN) {
       clientWs.close();
