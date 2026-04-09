@@ -172,10 +172,16 @@ export default function InterviewPage() {
     ws.onmessage = ({ data }) => {
       try {
         const m = JSON.parse(data);
-        if (m.type === 'audio')       playChunk(m.data);
-        if (m.type === 'text')        addMsg(m.role, m.content);
+        if (m.type === 'audio')        playChunk(m.data);
+        if (m.type === 'text')         addMsg(m.role, m.content);
         if (m.type === 'turnComplete') setAISpeaking(false);
         if (m.type === 'interviewEnd') setStatus('ended');
+        // Barge-in: user spoke while AI was talking — clear pending audio
+        if (m.type === 'interrupted') {
+          queueRef.current = [];
+          playingRef.current = false;
+          setAISpeaking(false);
+        }
       } catch {}
     };
     ws.onerror = () => setError('Connection error.');
