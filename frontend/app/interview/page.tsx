@@ -85,20 +85,35 @@ export default function InterviewPage() {
   const [feedbackLoading, setFbLoading] = useState(false);
 
   const wsRef      = useRef<WebSocket | null>(null);
-  const audioCtx   = useRef<AudioContext | null>(null);
+  const recCtxRef  = useRef<AudioContext | null>(null);  // 16 kHz – mic capture
+  const playCtxRef = useRef<AudioContext | null>(null);  // 24 kHz – AI playback
   const streamRef  = useRef<MediaStream | null>(null);
   const queueRef   = useRef<AudioBuffer[]>([]);
   const playingRef = useRef(false);
+  const mutedRef   = useRef(false);
   const bottomRef  = useRef<HTMLDivElement>(null);
+
+  // Keep mutedRef current so the audio processor closure always sees the latest value
+  useEffect(() => { mutedRef.current = muted; }, [muted]);
 
   const addMsg = useCallback((role: 'interviewer' | 'candidate', content: string) => {
     setMessages((prev) => [...prev, { role, content, ts: new Date() }]);
   }, []);
 
+  // Safe base64 encode for large typed arrays (avoids call-stack limit from spread)
+  function encodePCM(i16: Int16Array): string {
+    const bytes = new Uint8Array(i16.buffer);
+    let binary = '';
+    for (let j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+    return btoa(binary);
+  }
+
   const playChunk = useCallback((b64: string) => {
-    if (!audioCtx.current) return;
+    const ctx = playCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-    const buf = audioCtx.current.createBuffer(1, bytes.length / 2, 24000);
+    const buf = ctx.createBuffer(1, bytes.length / 2, 24000);
     const ch = buf.getChannelData(0);
     const view = new DataView(bytes.buffer);
     for (let i = 0; i < bytes.length / 2; i++) ch[i] = view.getInt16(i * 2, true) / 32768;
@@ -107,13 +122,14 @@ export default function InterviewPage() {
   }, []);
 
   function drain() {
-    if (!audioCtx.current || !queueRef.current.length) {
+    const ctx = playCtxRef.current;
+    if (!ctx || !queueRef.current.length) {
       playingRef.current = false; setAISpeaking(false); return;
     }
     playingRef.current = true; setAISpeaking(true);
-    const src = audioCtx.current.createBufferSource();
+    const src = ctx.createBufferSource();
     src.buffer = queueRef.current.shift()!;
-    src.connect(audioCtx.current.destination);
+    src.connect(ctx.destination);
     src.onended = drain; src.start();
   }
 
@@ -121,23 +137,27 @@ export default function InterviewPage() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      const ctx = new AudioContext({ sampleRate: 16000 });
-      audioCtx.current = ctx;
-      const src = ctx.createMediaStreamSource(stream);
-      const proc = ctx.createScriptProcessor(4096, 1, 1);
+
+      // Separate contexts: recording at 16 kHz (Gemini input), playback at 24 kHz (Gemini output)
+      recCtxRef.current  = new AudioContext({ sampleRate: 16000 });
+      playCtxRef.current = new AudioContext({ sampleRate: 24000 });
+
+      const recCtx = recCtxRef.current;
+      const src    = recCtx.createMediaStreamSource(stream);
+      const proc   = recCtx.createScriptProcessor(4096, 1, 1);
       proc.onaudioprocess = (e) => {
-        if (muted || ws.readyState !== WebSocket.OPEN) return;
+        if (mutedRef.current || ws.readyState !== WebSocket.OPEN) return;
         const f32 = e.inputBuffer.getChannelData(0);
         const i16 = new Int16Array(f32.length);
         for (let i = 0; i < f32.length; i++)
           i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
-        ws.send(JSON.stringify({ type: 'audio', data: btoa(String.fromCharCode(...new Uint8Array(i16.buffer))) }));
+        ws.send(JSON.stringify({ type: 'audio', data: encodePCM(i16) }));
       };
-      src.connect(proc); proc.connect(ctx.destination);
+      src.connect(proc); proc.connect(recCtx.destination);
     } catch {
       setError('Microphone access denied — type your responses below instead.');
     }
-  }, [muted]);
+  }, []);
 
   useEffect(() => {
     if (!sessionId) { setError('No session ID.'); return; }
@@ -155,7 +175,7 @@ export default function InterviewPage() {
     };
     ws.onerror = () => setError('Connection error.');
     ws.onclose = () => setStatus((s) => s !== 'ended' ? 'ended' : s);
-    return () => { ws.close(); streamRef.current?.getTracks().forEach((t) => t.stop()); audioCtx.current?.close(); };
+    return () => { ws.close(); streamRef.current?.getTracks().forEach((t) => t.stop()); recCtxRef.current?.close(); playCtxRef.current?.close(); };
   }, [sessionId]); // eslint-disable-line
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);

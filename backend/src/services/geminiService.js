@@ -67,9 +67,10 @@ async function handleInterviewSocket(clientWs, sessionId) {
 
   // Open connection to Gemini Live
   const geminiWs = new WebSocket(`${GEMINI_WS_URL}?key=${apiKey}`);
+  let setupComplete = false;
+  const audioQueue  = [];   // buffer audio until setup is ACK'd
 
   geminiWs.on('open', () => {
-    // Send setup message
     const setup = {
       setup: {
         model: 'models/gemini-2.0-flash-live-001',
@@ -87,6 +88,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
       },
     };
     geminiWs.send(JSON.stringify(setup));
+    console.log('[gemini] Setup message sent, waiting for setupComplete…');
   });
 
   // Gemini → browser
@@ -94,17 +96,23 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try {
       const msg = JSON.parse(data.toString());
 
+      // Wait for Gemini's setup ACK before forwarding audio
+      if (msg.setupComplete !== undefined) {
+        setupComplete = true;
+        console.log('[gemini] Setup complete — flushing', audioQueue.length, 'queued chunks');
+        while (audioQueue.length && geminiWs.readyState === WebSocket.OPEN) {
+          geminiWs.send(audioQueue.shift());
+        }
+        return;
+      }
+
       // Forward audio chunks directly to browser
       if (msg.serverContent?.modelTurn?.parts) {
         for (const part of msg.serverContent.modelTurn.parts) {
-          if (part.inlineData) {
-            // Audio chunk — forward as-is
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: 'audio', data: part.inlineData.data }));
-            }
+          if (part.inlineData && clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: 'audio', data: part.inlineData.data }));
           }
           if (part.text) {
-            // Text turn — store in transcript
             await appendTranscript(sessionId, 'interviewer', part.text);
             if (clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content: part.text }));
@@ -114,13 +122,11 @@ async function handleInterviewSocket(clientWs, sessionId) {
       }
 
       // Turn complete signal
-      if (msg.serverContent?.turnComplete) {
-        if (clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(JSON.stringify({ type: 'turnComplete' }));
-        }
+      if (msg.serverContent?.turnComplete && clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({ type: 'turnComplete' }));
       }
     } catch (e) {
-      console.error('Error processing Gemini message:', e.message);
+      console.error('[gemini] Error processing Gemini message:', e.message);
     }
   });
 
@@ -130,33 +136,28 @@ async function handleInterviewSocket(clientWs, sessionId) {
       const msg = JSON.parse(data.toString());
 
       if (msg.type === 'audio') {
-        // Raw PCM from browser microphone
-        const payload = {
+        const payload = JSON.stringify({
           realtime_input: {
-            media_chunks: [
-              {
-                mime_type: 'audio/pcm;rate=16000',
-                data: msg.data,
-              },
-            ],
+            media_chunks: [{ mime_type: 'audio/pcm;rate=16000', data: msg.data }],
           },
-        };
-        if (geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.send(JSON.stringify(payload));
+        });
+        if (!setupComplete) {
+          audioQueue.push(payload);   // queue until Gemini is ready
+        } else if (geminiWs.readyState === WebSocket.OPEN) {
+          geminiWs.send(payload);
         }
       }
 
       if (msg.type === 'text') {
-        // Text fallback input
         await appendTranscript(sessionId, 'candidate', msg.content);
-        const payload = {
+        const payload = JSON.stringify({
           client_content: {
             turns: [{ role: 'user', parts: [{ text: msg.content }] }],
             turn_complete: true,
           },
-        };
+        });
         if (geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.send(JSON.stringify(payload));
+          geminiWs.send(payload);
         }
       }
 
@@ -164,7 +165,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
         geminiWs.close();
       }
     } catch (e) {
-      console.error('Error processing client message:', e.message);
+      console.error('[gemini] Error processing client message:', e.message);
     }
   });
 
@@ -201,8 +202,12 @@ const MOCK_QUESTIONS = [
 
 function handleMockInterview(clientWs, sessionId) {
   let questionIndex = 0;
+  let silenceTimer  = null;
+  let hasAudio      = false;   // did we receive at least one audio chunk?
 
   const sendNext = () => {
+    silenceTimer = null;
+    hasAudio     = false;
     if (questionIndex >= MOCK_QUESTIONS.length) {
       clientWs.send(JSON.stringify({ type: 'interviewEnd' }));
       return;
@@ -210,6 +215,7 @@ function handleMockInterview(clientWs, sessionId) {
     const content = MOCK_QUESTIONS[questionIndex++];
     appendTranscript(sessionId, 'interviewer', content);
     clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content }));
+    clientWs.send(JSON.stringify({ type: 'turnComplete' }));
   };
 
   // Send first question after a short delay
@@ -218,13 +224,26 @@ function handleMockInterview(clientWs, sessionId) {
   clientWs.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
+
+      if (msg.type === 'audio') {
+        // Simulate VAD: advance to next question 2 s after the user stops sending audio
+        hasAudio = true;
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(sendNext, 2000);
+      }
+
       if (msg.type === 'text' && msg.content) {
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         await appendTranscript(sessionId, 'candidate', msg.content);
         setTimeout(sendNext, 1500);
       }
-      if (msg.type === 'end') clientWs.close();
+
+      if (msg.type === 'end') {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        clientWs.close();
+      }
     } catch (e) {
-      console.error('Mock WS error:', e.message);
+      console.error('[mock] WS error:', e.message);
     }
   });
 }
