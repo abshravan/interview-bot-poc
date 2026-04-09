@@ -1,23 +1,12 @@
 /**
- * Gemini Live — WebSocket relay service
+ * Gemini Live — interview relay service
  *
- * The browser opens a WebSocket to /ws/interview?sessionId=<id>.
- * This service:
- *   1. Accepts raw PCM audio chunks from the browser
- *   2. Forwards them to Gemini Live (BidiGenerateContent)
- *   3. Streams Gemini's audio response back to the browser
- *   4. Persists text turns to the Session transcript via the sessions route
- *
- * Gemini Live API endpoint (v1alpha):
- *   wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent
+ * Uses the @google/genai SDK (Gemini 2.0) for the Live API.
+ * Falls back to mock mode if the API key is missing or the connection fails.
  */
 
-const WebSocket = require('ws');
+const { GoogleGenAI } = require('@google/genai');
 const Session = require('../models/Session');
-const Resume = require('../models/Resume');
-
-const GEMINI_WS_URL =
-  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
 function buildSystemPrompt(role, resumeText) {
   return `You are a professional interviewer conducting a real-time voice interview.
@@ -28,213 +17,188 @@ Candidate's resume:
 ${resumeText}
 
 Rules:
-- Ask one question at a time
-- Wait for the candidate's answer before continuing
-- Ask relevant follow-up questions based on responses
+- Ask ONE question at a time, then STOP and wait for the candidate's answer
+- Do NOT ask another question until the candidate has finished speaking
+- Ask relevant follow-up questions based on their responses
 - Keep the conversation natural and professional
 - Be slightly challenging but respectful
-- Start by briefly introducing yourself and asking the first question`;
+- Start by briefly introducing yourself and asking the first question
+- After 4-5 questions, wrap up the interview politely`;
 }
 
 /**
  * Attach Gemini Live relay logic to a client WebSocket connection.
- * @param {WebSocket} clientWs  - the browser-side WebSocket
- * @param {string}    sessionId - MongoDB session _id
+ * @param {import('ws').WebSocket} clientWs
+ * @param {string} sessionId
  */
 async function handleInterviewSocket(clientWs, sessionId) {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey || apiKey === 'your_gemini_api_key_here') {
-    // Dev mode: echo mock messages so the UI still works without a real key
-    console.warn('GEMINI_API_KEY not set — running in mock interview mode');
+    console.warn('[gemini] GEMINI_API_KEY not set — running in mock interview mode');
     return handleMockInterview(clientWs, sessionId);
   }
 
-  // Load session + resume
-  let session;
+  // Load session + resume from DB
+  let dbSession;
   try {
-    session = await Session.findById(sessionId).populate('resumeId');
-    if (!session) {
-      clientWs.close(1008, 'Session not found');
-      return;
-    }
+    dbSession = await Session.findById(sessionId).populate('resumeId');
+    if (!dbSession) { clientWs.close(1008, 'Session not found'); return; }
   } catch (err) {
+    console.error('[gemini] DB error:', err.message);
     clientWs.close(1011, 'DB error');
     return;
   }
 
-  const systemPrompt = buildSystemPrompt(session.role, session.resumeId.text);
+  const systemPrompt = buildSystemPrompt(dbSession.role, dbSession.resumeId.text);
+  const ai = new GoogleGenAI({ apiKey });
 
-  // Open connection to Gemini Live
-  const geminiWs = new WebSocket(`${GEMINI_WS_URL}?key=${apiKey}`);
-  let setupComplete = false;
-  const audioQueue  = [];   // buffer audio until setup is ACK'd
+  // ── Fallback helper ─────────────────────────────────────────────────────────
+  let fellBack = false;
+  function fallbackToMock(reason) {
+    if (fellBack) return;
+    fellBack = true;
+    console.warn(`[gemini] Falling back to mock mode — ${reason}`);
+    if (clientWs.readyState === 1 /* OPEN */) {
+      clientWs.send(JSON.stringify({
+        type: 'text',
+        role: 'interviewer',
+        content: `[Running in demo mode — ${reason}]`,
+      }));
+      handleMockInterview(clientWs, sessionId);
+    }
+  }
 
-  geminiWs.on('open', () => {
-    // Gemini Live BidiGenerateContent WebSocket uses camelCase JSON field names
-    const setup = {
-      setup: {
-        model: 'models/gemini-2.0-flash-live-001',
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Charon' },
-            },
+  // ── Connect to Gemini Live ───────────────────────────────────────────────────
+  let liveSession;
+  try {
+    liveSession = await ai.live.connect({
+      model: 'gemini-2.0-flash-live-001',
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Charon' },
           },
         },
-        systemInstruction: {
-          parts: [{ text: systemPrompt }],
+        systemInstruction: systemPrompt,
+      },
+      callbacks: {
+        onopen() {
+          console.log('[gemini] Live session connected ✓');
+        },
+
+        onmessage(msg) {
+          try {
+            if (msg.serverContent?.modelTurn?.parts) {
+              for (const part of msg.serverContent.modelTurn.parts) {
+                if (part.inlineData && clientWs.readyState === 1) {
+                  clientWs.send(JSON.stringify({
+                    type: 'audio',
+                    data: part.inlineData.data,
+                  }));
+                }
+                if (part.text) {
+                  appendTranscript(sessionId, 'interviewer', part.text);
+                  if (clientWs.readyState === 1) {
+                    clientWs.send(JSON.stringify({
+                      type: 'text',
+                      role: 'interviewer',
+                      content: part.text,
+                    }));
+                  }
+                }
+              }
+            }
+            if (msg.serverContent?.turnComplete && clientWs.readyState === 1) {
+              clientWs.send(JSON.stringify({ type: 'turnComplete' }));
+            }
+          } catch (e) {
+            console.error('[gemini] Error handling message:', e.message);
+          }
+        },
+
+        onerror(err) {
+          const msg = err?.message || String(err);
+          console.error('[gemini] Live session error:', msg);
+          fallbackToMock(msg);
+        },
+
+        onclose(event) {
+          const reason = event?.reason || '(no reason)';
+          console.log(`[gemini] Live session closed — code: ${event?.code}  reason: ${reason}`);
+          if (!fellBack && clientWs.readyState === 1) {
+            clientWs.close();
+          }
         },
       },
-    };
-    geminiWs.send(JSON.stringify(setup));
-    console.log('[gemini] Setup message sent, waiting for setupComplete…');
-  });
+    });
+  } catch (err) {
+    console.error('[gemini] Failed to connect to Live API:', err.message);
+    fallbackToMock(err.message);
+    return;
+  }
 
-  // Gemini → browser
-  geminiWs.on('message', async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-
-      // Wait for Gemini's setup ACK before forwarding audio
-      if (msg.setupComplete !== undefined) {
-        setupComplete = true;
-        console.log('[gemini] Setup complete — flushing', audioQueue.length, 'queued chunks');
-        while (audioQueue.length && geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.send(audioQueue.shift());
-        }
-        return;
-      }
-
-      // Forward audio chunks directly to browser
-      if (msg.serverContent?.modelTurn?.parts) {
-        for (const part of msg.serverContent.modelTurn.parts) {
-          if (part.inlineData && clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({ type: 'audio', data: part.inlineData.data }));
-          }
-          if (part.text) {
-            await appendTranscript(sessionId, 'interviewer', part.text);
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content: part.text }));
-            }
-          }
-        }
-      }
-
-      // Turn complete signal
-      if (msg.serverContent?.turnComplete && clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({ type: 'turnComplete' }));
-      }
-    } catch (e) {
-      console.error('[gemini] Error processing Gemini message:', e.message);
-    }
-  });
-
-  // Browser → Gemini
+  // ── Browser → Gemini ────────────────────────────────────────────────────────
   clientWs.on('message', async (data) => {
+    if (fellBack) return;   // already in mock mode
     try {
       const msg = JSON.parse(data.toString());
 
       if (msg.type === 'audio') {
-        // camelCase: realtimeInput / mediaChunks / mimeType
-        const payload = JSON.stringify({
-          realtimeInput: {
-            mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: msg.data }],
-          },
+        liveSession.sendRealtimeInput({
+          audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
         });
-        if (!setupComplete) {
-          audioQueue.push(payload);   // queue until Gemini is ready
-        } else if (geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.send(payload);
-        }
       }
 
       if (msg.type === 'text') {
         await appendTranscript(sessionId, 'candidate', msg.content);
-        // camelCase: clientContent / turnComplete
-        const payload = JSON.stringify({
-          clientContent: {
-            turns: [{ role: 'user', parts: [{ text: msg.content }] }],
-            turnComplete: true,
-          },
+        liveSession.send({
+          turns: [{ role: 'user', parts: [{ text: msg.content }] }],
+          turnComplete: true,
         });
-        if (geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.send(payload);
-        }
       }
 
       if (msg.type === 'end') {
-        geminiWs.close();
+        try { liveSession.close(); } catch {}
       }
     } catch (e) {
       console.error('[gemini] Error processing client message:', e.message);
     }
   });
 
-  clientWs.on('close', () => geminiWs.close());
-
-  // Track whether we already fell back so we don't double-invoke mock mode
-  let fellBack = false;
-  function fallbackToMock(reason) {
-    if (fellBack) return;
-    fellBack = true;
-    console.warn(`[gemini] Falling back to mock mode — reason: ${reason}`);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      // Notify the browser so the user knows why, then start mock interview
-      clientWs.send(JSON.stringify({
-        type: 'text',
-        role: 'interviewer',
-        content: `[Demo mode — Gemini API unavailable: ${reason}] Starting mock interview.`,
-      }));
-      handleMockInterview(clientWs, sessionId);
+  clientWs.on('close', () => {
+    if (!fellBack && liveSession) {
+      try { liveSession.close(); } catch {}
     }
-  }
-
-  geminiWs.on('close', (code, reasonBuf) => {
-    const reason = reasonBuf?.toString() || '(no reason)';
-    console.log(`[gemini] WS closed — code: ${code}  reason: ${reason}`);
-    if (!setupComplete) {
-      // Closed before we ever got setupComplete — Gemini rejected the connection
-      fallbackToMock(`WS closed ${code}: ${reason}`);
-    } else if (!fellBack && clientWs.readyState === WebSocket.OPEN) {
-      clientWs.close();
-    }
-  });
-
-  geminiWs.on('error', (err) => {
-    console.error('[gemini] WS error:', err.message);
-    fallbackToMock(err.message);
   });
 }
 
+// ── Transcript helper ──────────────────────────────────────────────────────────
 async function appendTranscript(sessionId, role, content) {
   try {
     await Session.findByIdAndUpdate(sessionId, {
       $push: { transcript: { role, content } },
     });
   } catch (e) {
-    console.error('Failed to append transcript:', e.message);
+    console.error('[gemini] Failed to append transcript:', e.message);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Mock interview handler (no API key)
-// ---------------------------------------------------------------------------
+// ── Mock interview (no API key / fallback) ─────────────────────────────────────
 const MOCK_QUESTIONS = [
-  "Hello! I'm your interviewer today. Let's start — can you briefly introduce yourself and walk me through your background?",
-  "Great! Can you describe a challenging technical problem you've solved recently?",
+  "Hello! I'm your AI interviewer today. Let's start — can you briefly introduce yourself and walk me through your background?",
+  "Great! Can you describe a challenging technical problem you've solved recently and how you approached it?",
   "How do you approach debugging a complex issue in production?",
   "Tell me about a time you worked with a team under pressure. How did you handle it?",
   "Do you have any questions for me before we wrap up?",
 ];
 
-// How long mock waits before auto-advancing to the next question (ms)
-const MOCK_QUESTION_WINDOW = 12000;
+const MOCK_QUESTION_WINDOW = 12000;  // ms to wait before auto-advancing
 
 function handleMockInterview(clientWs, sessionId) {
   let questionIndex = 0;
-  let autoTimer     = null;   // auto-advance timer per question
+  let autoTimer     = null;
 
   const sendNext = () => {
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
@@ -246,7 +210,7 @@ function handleMockInterview(clientWs, sessionId) {
     appendTranscript(sessionId, 'interviewer', content);
     clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content }));
     clientWs.send(JSON.stringify({ type: 'turnComplete' }));
-    // Auto-advance after the window so the interview doesn't stall when user speaks
+    // Auto-advance after window so interview never stalls
     autoTimer = setTimeout(sendNext, MOCK_QUESTION_WINDOW);
   };
 
@@ -255,22 +219,16 @@ function handleMockInterview(clientWs, sessionId) {
   clientWs.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
-
-      // Text input: advance immediately after a short pause
       if (msg.type === 'text' && msg.content) {
         await appendTranscript(sessionId, 'candidate', msg.content);
         if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
         setTimeout(sendNext, 1500);
       }
-
-      // Audio input is streamed continuously — do NOT reset timer on every chunk
-      // (ScriptProcessor fires every ~256 ms even during silence).
-      // The fixed MOCK_QUESTION_WINDOW above handles the listening gap.
-
       if (msg.type === 'end') {
         if (autoTimer) clearTimeout(autoTimer);
         clientWs.close();
       }
+      // Audio chunks are ignored in mock mode; the auto-timer handles pacing
     } catch (e) {
       console.error('[mock] WS error:', e.message);
     }
