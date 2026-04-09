@@ -73,7 +73,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
   let liveSession;
   try {
     liveSession = await ai.live.connect({
-      model: 'gemini-2.0-flash-live-001',
+      model: 'gemini3-flash-live',
       config: {
         responseModalities: ['AUDIO'],
         speechConfig: {
