@@ -6,6 +6,7 @@ import { Mic, MicOff, Send, PhoneOff, Star, ChevronRight, Clock, MessageSquare }
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { generateFeedback } from '@/lib/api';
+import ProtectedRoute from '@/components/protected-route';
 
 interface Message {
   role: 'interviewer' | 'candidate';
@@ -186,6 +187,7 @@ export default function InterviewPage() {
   }
 
   return (
+    <ProtectedRoute>
     <div className="min-h-screen bg-benz-black flex flex-col">
 
       {/* Header */}
@@ -363,5 +365,6 @@ export default function InterviewPage() {
         </div>
       </div>
     </div>
+    </ProtectedRoute>
   );
 }

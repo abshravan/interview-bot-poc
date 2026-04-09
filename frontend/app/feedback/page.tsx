@@ -9,6 +9,7 @@ import { Progress } from '@/components/ui/progress';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Card, CardContent } from '@/components/ui/card';
 import { getFeedback, getSession } from '@/lib/api';
+import ProtectedRoute from '@/components/protected-route';
 
 interface Feedback {
   strengths: string[];
@@ -114,6 +115,7 @@ export default function FeedbackPage() {
   const g = grade(overall);
 
   return (
+    <ProtectedRoute>
     <div className="min-h-screen bg-benz-black">
       {/* Header */}
       <header className="glass border-b border-white/[0.04] px-5 h-14 flex items-center justify-between">
@@ -250,5 +252,6 @@ export default function FeedbackPage() {
         </div>
       </div>
     </div>
+    </ProtectedRoute>
   );
 }

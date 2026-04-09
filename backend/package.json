@@ -17,7 +17,8 @@
     "ws": "^8.17.1",
     "axios": "^1.7.2",
     "form-data": "^4.0.0",
-    "@google/generative-ai": "^0.15.0"
+    "@google/generative-ai": "^0.15.0",
+    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.3"

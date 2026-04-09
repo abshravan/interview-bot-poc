@@ -1,16 +1,14 @@
 const express = require('express');
 const multer = require('multer');
-const axios = require('axios');
-const FormData = require('form-data');
+const pdfParse = require('pdf-parse');
 const Resume = require('../models/Resume');
 
 const router = express.Router();
 
-// Store file in memory so we can forward it to the Python parser
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
-  fileFilter: (req, file, cb) => {
+  fileFilter: (_req, file, cb) => {
     if (file.mimetype === 'application/pdf') return cb(null, true);
     cb(new Error('Only PDF files are accepted'));
   },
@@ -21,20 +19,19 @@ router.post('/upload', upload.single('resume'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    // Forward the PDF to the Python resume parser
-    const form = new FormData();
-    form.append('file', req.file.buffer, {
-      filename: req.file.originalname,
-      contentType: 'application/pdf',
-    });
+    // Parse PDF in-process — no separate Python service required
+    let text;
+    try {
+      const parsed = await pdfParse(req.file.buffer);
+      text = parsed.text?.trim();
+    } catch (parseErr) {
+      console.error('PDF parse error:', parseErr.message);
+      return res.status(422).json({ error: 'Could not extract text from the PDF. Make sure it is not scanned/image-only.' });
+    }
 
-    const parserRes = await axios.post(
-      `${process.env.RESUME_PARSER_URL}/parse`,
-      form,
-      { headers: form.getHeaders() }
-    );
-
-    const { text } = parserRes.data;
+    if (!text) {
+      return res.status(422).json({ error: 'PDF appears to contain no extractable text (may be image-based).' });
+    }
 
     const resume = await Resume.create({
       filename: req.file.originalname,

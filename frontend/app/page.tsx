@@ -11,6 +11,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { uploadResume, createSession } from '@/lib/api';
+import ProtectedRoute from '@/components/protected-route';
 
 const ROLES = [
   { id: 'Software Engineer',         icon: Code2,        label: 'Software Engineer' },
@@ -111,7 +112,7 @@ export default function HomePage() {
   }
 
   return (
-    <>
+    <ProtectedRoute>
       <Navbar />
       <main className="min-h-screen pt-[60px]">
 
@@ -328,6 +329,6 @@ export default function HomePage() {
           </div>
         </footer>
       </main>
-    </>
+    </ProtectedRoute>
   );
 }
