@@ -17,7 +17,7 @@ const Session = require('../models/Session');
 const Resume = require('../models/Resume');
 
 const GEMINI_WS_URL =
-  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent';
+  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
 function buildSystemPrompt(role, resumeText) {
   return `You are a professional interviewer conducting a real-time voice interview.
