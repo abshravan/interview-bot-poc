@@ -71,18 +71,19 @@ async function handleInterviewSocket(clientWs, sessionId) {
   const audioQueue  = [];   // buffer audio until setup is ACK'd
 
   geminiWs.on('open', () => {
+    // Gemini Live BidiGenerateContent WebSocket uses camelCase JSON field names
     const setup = {
       setup: {
         model: 'models/gemini-2.0-flash-live-001',
-        generation_config: {
-          response_modalities: ['AUDIO'],
-          speech_config: {
-            voice_config: {
-              prebuilt_voice_config: { voice_name: 'Charon' },
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Charon' },
             },
           },
         },
-        system_instruction: {
+        systemInstruction: {
           parts: [{ text: systemPrompt }],
         },
       },
@@ -136,9 +137,10 @@ async function handleInterviewSocket(clientWs, sessionId) {
       const msg = JSON.parse(data.toString());
 
       if (msg.type === 'audio') {
+        // camelCase: realtimeInput / mediaChunks / mimeType
         const payload = JSON.stringify({
-          realtime_input: {
-            media_chunks: [{ mime_type: 'audio/pcm;rate=16000', data: msg.data }],
+          realtimeInput: {
+            mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: msg.data }],
           },
         });
         if (!setupComplete) {
@@ -150,10 +152,11 @@ async function handleInterviewSocket(clientWs, sessionId) {
 
       if (msg.type === 'text') {
         await appendTranscript(sessionId, 'candidate', msg.content);
+        // camelCase: clientContent / turnComplete
         const payload = JSON.stringify({
-          client_content: {
+          clientContent: {
             turns: [{ role: 'user', parts: [{ text: msg.content }] }],
-            turn_complete: true,
+            turnComplete: true,
           },
         });
         if (geminiWs.readyState === WebSocket.OPEN) {
@@ -200,14 +203,15 @@ const MOCK_QUESTIONS = [
   "Do you have any questions for me before we wrap up?",
 ];
 
+// How long mock waits before auto-advancing to the next question (ms)
+const MOCK_QUESTION_WINDOW = 12000;
+
 function handleMockInterview(clientWs, sessionId) {
   let questionIndex = 0;
-  let silenceTimer  = null;
-  let hasAudio      = false;   // did we receive at least one audio chunk?
+  let autoTimer     = null;   // auto-advance timer per question
 
   const sendNext = () => {
-    silenceTimer = null;
-    hasAudio     = false;
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
     if (questionIndex >= MOCK_QUESTIONS.length) {
       clientWs.send(JSON.stringify({ type: 'interviewEnd' }));
       return;
@@ -216,30 +220,29 @@ function handleMockInterview(clientWs, sessionId) {
     appendTranscript(sessionId, 'interviewer', content);
     clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content }));
     clientWs.send(JSON.stringify({ type: 'turnComplete' }));
+    // Auto-advance after the window so the interview doesn't stall when user speaks
+    autoTimer = setTimeout(sendNext, MOCK_QUESTION_WINDOW);
   };
 
-  // Send first question after a short delay
   setTimeout(sendNext, 1000);
 
   clientWs.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
 
-      if (msg.type === 'audio') {
-        // Simulate VAD: advance to next question 2 s after the user stops sending audio
-        hasAudio = true;
-        if (silenceTimer) clearTimeout(silenceTimer);
-        silenceTimer = setTimeout(sendNext, 2000);
-      }
-
+      // Text input: advance immediately after a short pause
       if (msg.type === 'text' && msg.content) {
-        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         await appendTranscript(sessionId, 'candidate', msg.content);
+        if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
         setTimeout(sendNext, 1500);
       }
 
+      // Audio input is streamed continuously — do NOT reset timer on every chunk
+      // (ScriptProcessor fires every ~256 ms even during silence).
+      // The fixed MOCK_QUESTION_WINDOW above handles the listening gap.
+
       if (msg.type === 'end') {
-        if (silenceTimer) clearTimeout(silenceTimer);
+        if (autoTimer) clearTimeout(autoTimer);
         clientWs.close();
       }
     } catch (e) {

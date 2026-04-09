@@ -138,9 +138,8 @@ export default function InterviewPage() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // Separate contexts: recording at 16 kHz (Gemini input), playback at 24 kHz (Gemini output)
-      recCtxRef.current  = new AudioContext({ sampleRate: 16000 });
-      playCtxRef.current = new AudioContext({ sampleRate: 24000 });
+      // Recording context only — playback context is created in the main useEffect
+      recCtxRef.current = new AudioContext({ sampleRate: 16000 });
 
       const recCtx = recCtxRef.current;
       const src    = recCtx.createMediaStreamSource(stream);
@@ -161,6 +160,12 @@ export default function InterviewPage() {
 
   useEffect(() => {
     if (!sessionId) { setError('No session ID.'); return; }
+
+    // Create playback context synchronously before the WebSocket opens so it is
+    // guaranteed to exist when the first audio chunk arrives from Gemini.
+    // 24 kHz matches Gemini Live's output sample rate.
+    playCtxRef.current = new AudioContext({ sampleRate: 24000 });
+
     const ws = new WebSocket(`${WS_BASE}/ws/interview?sessionId=${sessionId}`);
     wsRef.current = ws;
     ws.onopen    = () => { setStatus('active'); startMic(ws); };
