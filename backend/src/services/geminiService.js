@@ -1,37 +1,33 @@
 /**
- * Gemini interview service — text-based with Gemini Flash chat API.
+ * Gemini Live — interview relay service
  *
- * The browser sends transcribed speech as text messages over WebSocket.
- * This service maintains a chat session with Gemini and sends text responses
- * back to the frontend, which speaks them using the browser SpeechSynthesis API.
- *
- * Falls back to scripted mock questions when no API key is set.
+ * Uses the @google/genai SDK (Gemini 2.0) for the Live API.
+ * Falls back to mock mode if the API key is missing or the connection fails.
  */
 
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { GoogleGenAI } = require('@google/genai');
 const Session = require('../models/Session');
 
-const GEMINI_MODEL = 'gemini-1.5-flash';
-const MAX_QUESTIONS = 6;   // end interview after this many AI turns
-
 function buildSystemPrompt(role, resumeText) {
-  return `You are a professional interviewer conducting a real-time voice interview. Your responses will be spoken aloud, so keep them concise and conversational.
+  return `You are a professional interviewer conducting a real-time voice interview.
 
 Role being interviewed for: ${role}
 
 Candidate's resume:
 ${resumeText}
 
-Strict rules:
-- Ask EXACTLY ONE question per response, then stop and wait
-- Keep responses to 2-3 sentences maximum (voice context)
-- Do NOT list multiple questions or bullet points
-- React naturally to the candidate's answers before asking the next question
-- After ${MAX_QUESTIONS} questions, end with: "That concludes our interview today. Thank you for your time — you'll receive feedback shortly."
-- Start by greeting the candidate and asking your first question`;
+Rules:
+- Ask ONE question at a time, then STOP and wait for the candidate's answer
+- Do NOT ask another question until the candidate has finished speaking
+- Ask relevant follow-up questions based on their responses
+- Keep the conversation natural and professional
+- Be slightly challenging but respectful
+- Start by briefly introducing yourself and asking the first question
+- After 4-5 questions, wrap up the interview politely`;
 }
 
 /**
+ * Attach Gemini Live relay logic to a client WebSocket connection.
  * @param {import('ws').WebSocket} clientWs
  * @param {string} sessionId
  */
@@ -39,93 +35,143 @@ async function handleInterviewSocket(clientWs, sessionId) {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey || apiKey === 'your_gemini_api_key_here') {
-    console.warn('[interview] No API key — running mock mode');
+    console.warn('[gemini] GEMINI_API_KEY not set — running in mock interview mode');
     return handleMockInterview(clientWs, sessionId);
   }
 
-  // Load session + resume
+  // Load session + resume from DB
   let dbSession;
   try {
     dbSession = await Session.findById(sessionId).populate('resumeId');
     if (!dbSession) { clientWs.close(1008, 'Session not found'); return; }
   } catch (err) {
-    console.error('[interview] DB error:', err.message);
+    console.error('[gemini] DB error:', err.message);
     clientWs.close(1011, 'DB error');
     return;
   }
 
-  const genAI   = new GoogleGenerativeAI(apiKey);
-  const model   = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
-    systemInstruction: buildSystemPrompt(dbSession.role, dbSession.resumeId.text),
-  });
-  const chat         = model.startChat({ history: [] });
-  let   turnCount    = 0;
-  let   fellBack     = false;
-  let   interviewEnded = false;
+  const systemPrompt = buildSystemPrompt(dbSession.role, dbSession.resumeId.text);
+  const ai = new GoogleGenAI({ apiKey });
 
+  // ── Fallback helper ─────────────────────────────────────────────────────────
+  let fellBack = false;
   function fallbackToMock(reason) {
     if (fellBack) return;
     fellBack = true;
-    console.warn(`[interview] Falling back to mock — ${reason}`);
-    if (clientWs.readyState === 1) {
+    console.warn(`[gemini] Falling back to mock mode — ${reason}`);
+    if (clientWs.readyState === 1 /* OPEN */) {
       clientWs.send(JSON.stringify({
-        type: 'text', role: 'interviewer',
-        content: `[Demo mode — ${reason}] Starting mock interview.`,
+        type: 'text',
+        role: 'interviewer',
+        content: `[Running in demo mode — ${reason}]`,
       }));
       handleMockInterview(clientWs, sessionId);
     }
   }
 
-  async function sendAIResponse(userMessage) {
-    try {
-      const result = await chat.sendMessage(userMessage);
-      const text   = result.response.text().trim();
-      turnCount++;
+  // ── Connect to Gemini Live ───────────────────────────────────────────────────
+  let liveSession;
+  try {
+    liveSession = await ai.live.connect({
+      model: 'gemini-2.0-flash-live-001',
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Charon' },
+          },
+        },
+        systemInstruction: systemPrompt,
+      },
+      callbacks: {
+        onopen() {
+          console.log('[gemini] Live session connected ✓');
+        },
 
-      await appendTranscript(sessionId, 'interviewer', text);
-      if (clientWs.readyState === 1) {
-        clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content: text }));
-        clientWs.send(JSON.stringify({ type: 'turnComplete' }));
-      }
+        onmessage(msg) {
+          try {
+            if (msg.serverContent?.modelTurn?.parts) {
+              for (const part of msg.serverContent.modelTurn.parts) {
+                if (part.inlineData && clientWs.readyState === 1) {
+                  clientWs.send(JSON.stringify({
+                    type: 'audio',
+                    data: part.inlineData.data,
+                  }));
+                }
+                if (part.text) {
+                  appendTranscript(sessionId, 'interviewer', part.text);
+                  if (clientWs.readyState === 1) {
+                    clientWs.send(JSON.stringify({
+                      type: 'text',
+                      role: 'interviewer',
+                      content: part.text,
+                    }));
+                  }
+                }
+              }
+            }
+            if (msg.serverContent?.turnComplete && clientWs.readyState === 1) {
+              clientWs.send(JSON.stringify({ type: 'turnComplete' }));
+            }
+          } catch (e) {
+            console.error('[gemini] Error handling message:', e.message);
+          }
+        },
 
-      // Check if interview should end
-      const endPhrases = ['concludes our interview', 'thank you for your time', 'feedback shortly'];
-      const shouldEnd  = turnCount >= MAX_QUESTIONS ||
-                         endPhrases.some((p) => text.toLowerCase().includes(p));
-      if (shouldEnd && !interviewEnded) {
-        interviewEnded = true;
-        setTimeout(() => {
-          if (clientWs.readyState === 1) clientWs.send(JSON.stringify({ type: 'interviewEnd' }));
-        }, 4000);
-      }
-    } catch (err) {
-      console.error('[interview] Gemini error:', err.message);
-      fallbackToMock(err.message);
-    }
+        onerror(err) {
+          const msg = err?.message || String(err);
+          console.error('[gemini] Live session error:', msg);
+          fallbackToMock(msg);
+        },
+
+        onclose(event) {
+          const reason = event?.reason || '(no reason)';
+          console.log(`[gemini] Live session closed — code: ${event?.code}  reason: ${reason}`);
+          if (!fellBack && clientWs.readyState === 1) {
+            clientWs.close();
+          }
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[gemini] Failed to connect to Live API:', err.message);
+    fallbackToMock(err.message);
+    return;
   }
 
-  // Kick off with the opening question
-  setTimeout(() => sendAIResponse('Begin the interview now.'), 500);
-
+  // ── Browser → Gemini ────────────────────────────────────────────────────────
   clientWs.on('message', async (data) => {
-    if (fellBack || interviewEnded) return;
+    if (fellBack) return;   // already in mock mode
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.type === 'text' && msg.content?.trim()) {
-        await appendTranscript(sessionId, 'candidate', msg.content);
-        await sendAIResponse(msg.content);
+
+      if (msg.type === 'audio') {
+        liveSession.sendRealtimeInput({
+          audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
+        });
       }
+
+      if (msg.type === 'text') {
+        await appendTranscript(sessionId, 'candidate', msg.content);
+        liveSession.send({
+          turns: [{ role: 'user', parts: [{ text: msg.content }] }],
+          turnComplete: true,
+        });
+      }
+
       if (msg.type === 'end') {
-        interviewEnded = true;
-        clientWs.close();
+        try { liveSession.close(); } catch {}
       }
     } catch (e) {
-      console.error('[interview] Error processing message:', e.message);
+      console.error('[gemini] Error processing client message:', e.message);
     }
   });
 
-  clientWs.on('close', () => { /* nothing to clean up */ });
+  clientWs.on('close', () => {
+    if (!fellBack && liveSession) {
+      try { liveSession.close(); } catch {}
+    }
+  });
 }
 
 // ── Transcript helper ──────────────────────────────────────────────────────────
@@ -135,21 +181,20 @@ async function appendTranscript(sessionId, role, content) {
       $push: { transcript: { role, content } },
     });
   } catch (e) {
-    console.error('[interview] Failed to append transcript:', e.message);
+    console.error('[gemini] Failed to append transcript:', e.message);
   }
 }
 
 // ── Mock interview (no API key / fallback) ─────────────────────────────────────
 const MOCK_QUESTIONS = [
-  "Hello! I'm your AI interviewer. Let's get started — can you briefly introduce yourself and walk me through your background?",
+  "Hello! I'm your AI interviewer today. Let's start — can you briefly introduce yourself and walk me through your background?",
   "Great! Can you describe a challenging technical problem you've solved recently and how you approached it?",
-  "How do you approach debugging a complex issue in a production system?",
+  "How do you approach debugging a complex issue in production?",
   "Tell me about a time you worked with a team under pressure. How did you handle it?",
-  "What aspects of this role excite you the most, and how does it align with your career goals?",
-  "That concludes our interview today. Thank you for your time — you'll receive feedback shortly.",
+  "Do you have any questions for me before we wrap up?",
 ];
 
-const MOCK_QUESTION_WINDOW = 12000;
+const MOCK_QUESTION_WINDOW = 12000;  // ms to wait before auto-advancing
 
 function handleMockInterview(clientWs, sessionId) {
   let questionIndex = 0;
@@ -165,6 +210,7 @@ function handleMockInterview(clientWs, sessionId) {
     appendTranscript(sessionId, 'interviewer', content);
     clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content }));
     clientWs.send(JSON.stringify({ type: 'turnComplete' }));
+    // Auto-advance after window so interview never stalls
     autoTimer = setTimeout(sendNext, MOCK_QUESTION_WINDOW);
   };
 
@@ -173,7 +219,7 @@ function handleMockInterview(clientWs, sessionId) {
   clientWs.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.type === 'text' && msg.content?.trim()) {
+      if (msg.type === 'text' && msg.content) {
         await appendTranscript(sessionId, 'candidate', msg.content);
         if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
         setTimeout(sendNext, 1500);
@@ -182,6 +228,7 @@ function handleMockInterview(clientWs, sessionId) {
         if (autoTimer) clearTimeout(autoTimer);
         clientWs.close();
       }
+      // Audio chunks are ignored in mock mode; the auto-timer handles pacing
     } catch (e) {
       console.error('[mock] WS error:', e.message);
     }

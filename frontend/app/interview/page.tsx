@@ -80,121 +80,111 @@ export default function InterviewPage() {
   const [status, setStatus]             = useState<'connecting' | 'active' | 'ended'>('connecting');
   const [muted, setMuted]               = useState(false);
   const [aiSpeaking, setAISpeaking]     = useState(false);
-  const [listening, setListening]       = useState(false);
   const [text, setText]                 = useState('');
   const [error, setError]               = useState('');
   const [feedbackLoading, setFbLoading] = useState(false);
 
-  const wsRef          = useRef<WebSocket | null>(null);
-  const recognitionRef = useRef<any>(null);
-  const mutedRef       = useRef(false);
-  const bottomRef      = useRef<HTMLDivElement>(null);
+  const wsRef      = useRef<WebSocket | null>(null);
+  const recCtxRef  = useRef<AudioContext | null>(null);  // 16 kHz – mic capture
+  const playCtxRef = useRef<AudioContext | null>(null);  // 24 kHz – AI playback
+  const streamRef  = useRef<MediaStream | null>(null);
+  const queueRef   = useRef<AudioBuffer[]>([]);
+  const playingRef = useRef(false);
+  const mutedRef   = useRef(false);
+  const bottomRef  = useRef<HTMLDivElement>(null);
 
+  // Keep mutedRef current so the audio processor closure always sees the latest value
   useEffect(() => { mutedRef.current = muted; }, [muted]);
 
   const addMsg = useCallback((role: 'interviewer' | 'candidate', content: string) => {
     setMessages((prev) => [...prev, { role, content, ts: new Date() }]);
   }, []);
 
-  /* ── Text-to-speech (AI speaks its response) ─────────────────────────────── */
-  const speak = useCallback((utteranceText: string) => {
-    if (!('speechSynthesis' in window)) return;
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(utteranceText);
-    u.rate  = 0.95;
-    u.pitch = 1.0;
-    u.onstart = () => setAISpeaking(true);
-    u.onend   = () => setAISpeaking(false);
-    u.onerror = () => setAISpeaking(false);
-    window.speechSynthesis.speak(u);
+  // Safe base64 encode for large typed arrays (avoids call-stack limit from spread)
+  function encodePCM(i16: Int16Array): string {
+    const bytes = new Uint8Array(i16.buffer);
+    let binary = '';
+    for (let j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+    return btoa(binary);
+  }
+
+  const playChunk = useCallback((b64: string) => {
+    const ctx = playCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const buf = ctx.createBuffer(1, bytes.length / 2, 24000);
+    const ch = buf.getChannelData(0);
+    const view = new DataView(bytes.buffer);
+    for (let i = 0; i < bytes.length / 2; i++) ch[i] = view.getInt16(i * 2, true) / 32768;
+    queueRef.current.push(buf);
+    if (!playingRef.current) drain();
   }, []);
 
-  /* ── Speech recognition (user speaks, browser transcribes) ──────────────── */
-  const startRecognition = useCallback((ws: WebSocket) => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) {
-      setError('Speech recognition not supported in this browser — use Chrome or Edge, or type below.');
-      return;
+  function drain() {
+    const ctx = playCtxRef.current;
+    if (!ctx || !queueRef.current.length) {
+      playingRef.current = false; setAISpeaking(false); return;
     }
-    const rec: any = new SR();
-    rec.continuous      = true;
-    rec.interimResults  = false;
-    rec.lang            = 'en-US';
+    playingRef.current = true; setAISpeaking(true);
+    const src = ctx.createBufferSource();
+    src.buffer = queueRef.current.shift()!;
+    src.connect(ctx.destination);
+    src.onended = drain; src.start();
+  }
 
-    rec.onstart = () => setListening(true);
-    rec.onend   = () => {
-      setListening(false);
-      // Auto-restart so recognition stays live for the whole interview
-      if (!mutedRef.current && ws.readyState === WebSocket.OPEN) {
-        setTimeout(() => { try { rec.start(); } catch {} }, 200);
-      }
-    };
-    rec.onresult = (e: any) => {
-      const transcript = e.results[e.results.length - 1][0].transcript.trim();
-      if (!transcript || mutedRef.current || ws.readyState !== WebSocket.OPEN) return;
-      addMsg('candidate', transcript);
-      ws.send(JSON.stringify({ type: 'text', content: transcript }));
-    };
-    rec.onerror = (e: any) => {
-      // 'no-speech' and 'aborted' are normal; surface real errors
-      if (e.error === 'no-speech' || e.error === 'aborted') return;
-      setError(`Mic error: ${e.error} — you can type below instead.`);
-    };
+  const startMic = useCallback(async (ws: WebSocket) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
 
-    recognitionRef.current = rec;
-    rec.start();
-  }, [addMsg]);
+      // Recording context only — playback context is created in the main useEffect
+      recCtxRef.current = new AudioContext({ sampleRate: 16000 });
 
-  /* ── WebSocket lifecycle ─────────────────────────────────────────────────── */
+      const recCtx = recCtxRef.current;
+      const src    = recCtx.createMediaStreamSource(stream);
+      const proc   = recCtx.createScriptProcessor(4096, 1, 1);
+      proc.onaudioprocess = (e) => {
+        if (mutedRef.current || ws.readyState !== WebSocket.OPEN) return;
+        const f32 = e.inputBuffer.getChannelData(0);
+        const i16 = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++)
+          i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+        ws.send(JSON.stringify({ type: 'audio', data: encodePCM(i16) }));
+      };
+      src.connect(proc); proc.connect(recCtx.destination);
+    } catch {
+      setError('Microphone access denied — type your responses below instead.');
+    }
+  }, []);
+
   useEffect(() => {
     if (!sessionId) { setError('No session ID.'); return; }
 
+    // Create playback context synchronously before the WebSocket opens so it is
+    // guaranteed to exist when the first audio chunk arrives from Gemini.
+    // 24 kHz matches Gemini Live's output sample rate.
+    playCtxRef.current = new AudioContext({ sampleRate: 24000 });
+
     const ws = new WebSocket(`${WS_BASE}/ws/interview?sessionId=${sessionId}`);
     wsRef.current = ws;
-
-    ws.onopen = () => { setStatus('active'); startRecognition(ws); };
-
+    ws.onopen    = () => { setStatus('active'); startMic(ws); };
     ws.onmessage = ({ data }) => {
       try {
         const m = JSON.parse(data);
-        if (m.type === 'text') {
-          addMsg(m.role, m.content);
-          if (m.role === 'interviewer') speak(m.content);
-        }
+        if (m.type === 'audio')       playChunk(m.data);
+        if (m.type === 'text')        addMsg(m.role, m.content);
         if (m.type === 'turnComplete') setAISpeaking(false);
         if (m.type === 'interviewEnd') setStatus('ended');
       } catch {}
     };
-
     ws.onerror = () => setError('Connection error.');
     ws.onclose = () => setStatus((s) => s !== 'ended' ? 'ended' : s);
-
-    return () => {
-      ws.close();
-      try { recognitionRef.current?.stop(); } catch {}
-      window.speechSynthesis?.cancel();
-    };
+    return () => { ws.close(); streamRef.current?.getTracks().forEach((t) => t.stop()); recCtxRef.current?.close(); playCtxRef.current?.close(); };
   }, [sessionId]); // eslint-disable-line
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
-  /* ── Mute toggle ─────────────────────────────────────────────────────────── */
-  function toggleMute() {
-    const next = !muted;
-    setMuted(next);
-    mutedRef.current = next;
-    if (next) {
-      try { recognitionRef.current?.stop(); } catch {}
-      setListening(false);
-    } else {
-      const ws = wsRef.current;
-      if (ws?.readyState === WebSocket.OPEN) {
-        try { recognitionRef.current?.start(); } catch {}
-      }
-    }
-  }
-
-  /* ── Text fallback send ──────────────────────────────────────────────────── */
   function send() {
     const c = text.trim();
     if (!c || wsRef.current?.readyState !== WebSocket.OPEN) return;
@@ -206,8 +196,7 @@ export default function InterviewPage() {
   function end() {
     wsRef.current?.send(JSON.stringify({ type: 'end' }));
     wsRef.current?.close();
-    try { recognitionRef.current?.stop(); } catch {}
-    window.speechSynthesis?.cancel();
+    streamRef.current?.getTracks().forEach((t) => t.stop());
     setStatus('ended');
   }
 
@@ -252,13 +241,6 @@ export default function InterviewPage() {
               <Timer running />
             </div>
           )}
-          {/* Listening indicator */}
-          {status === 'active' && listening && !muted && (
-            <div className="flex items-center gap-1.5 text-emerald-400">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-[0.65rem] uppercase tracking-wide">Listening</span>
-            </div>
-          )}
           <Badge variant="default" className="gap-1">
             <MessageSquare size={9} />
             {messages.length}
@@ -280,26 +262,23 @@ export default function InterviewPage() {
           <div className="text-center">
             <p className="text-sm font-medium text-benz-chrome">AI Interviewer</p>
             <p className="text-[0.65rem] text-benz-muted mt-1 uppercase tracking-wide">
-              {aiSpeaking ? 'Speaking…' : listening && !muted ? 'Listening' : status === 'active' ? 'Ready' : 'Offline'}
+              {aiSpeaking ? 'Speaking…' : status === 'active' ? 'Listening' : 'Offline'}
             </p>
           </div>
           <Visualizer active={aiSpeaking} />
           {status === 'active' && (
             <button
-              onClick={toggleMute}
+              onClick={() => setMuted((m) => !m)}
               className={`w-11 h-11 rounded-full flex items-center justify-center border transition-all duration-200 ${
                 muted
                   ? 'bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20'
-                  : listening
-                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'
-                    : 'bg-benz-surface border-benz-border text-benz-silver hover:border-benz-border-2 hover:shadow-glow-silver'
+                  : 'bg-benz-surface border-benz-border text-benz-silver hover:border-benz-border-2 hover:shadow-glow-silver'
               }`}
             >
               {muted ? <MicOff size={17} /> : <Mic size={17} />}
             </button>
           )}
           {muted && <p className="text-[0.65rem] text-red-400 -mt-4">Microphone muted</p>}
-          {!muted && listening && <p className="text-[0.65rem] text-emerald-400 -mt-4">Mic active</p>}
         </div>
 
         {/* Transcript + input */}
@@ -340,7 +319,7 @@ export default function InterviewPage() {
               </div>
             ))}
 
-            {/* Typing indicator while AI is thinking/speaking */}
+            {/* Typing indicator */}
             {aiSpeaking && (
               <div className="flex gap-2.5 animate-fade-in">
                 <div className="w-7 h-7 rounded-lg bg-benz-surface2 border border-benz-silver/20 flex items-center justify-center text-[11px] text-benz-silver shrink-0">AI</div>
@@ -364,13 +343,9 @@ export default function InterviewPage() {
           {status === 'active' && (
             <div className="border-t border-benz-border px-4 py-3 flex gap-2.5">
               <button
-                onClick={toggleMute}
+                onClick={() => setMuted((m) => !m)}
                 className={`lg:hidden w-10 h-10 rounded-xl flex items-center justify-center border transition-all ${
-                  muted
-                    ? 'bg-red-500/10 border-red-500/30 text-red-400'
-                    : listening
-                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                      : 'bg-benz-surface2 border-benz-border text-benz-silver'
+                  muted ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-benz-surface2 border-benz-border text-benz-silver'
                 }`}
               >
                 {muted ? <MicOff size={15} /> : <Mic size={15} />}
@@ -378,7 +353,7 @@ export default function InterviewPage() {
 
               <input
                 className="flex-1 h-10 bg-benz-surface border border-benz-border rounded-xl px-4 text-sm text-benz-chrome placeholder:text-benz-muted/60 focus:outline-none focus:border-benz-border-2 focus:ring-2 focus:ring-benz-silver/10 transition-all"
-                placeholder={listening && !muted ? 'Listening… or type here' : 'Type your response…'}
+                placeholder="Type your response or just speak…"
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && send()}
