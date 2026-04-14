@@ -14,7 +14,7 @@ const GEMINI_WS_URL =
   'wss://generativelanguage.googleapis.com/ws/' +
   'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
-const DEFAULT_MODEL = 'gemini-2.0-flash-live-001';
+const DEFAULT_MODEL = 'gemini-3.0-flash-live';
 
 // ── Prompt ─────────────────────────────────────────────────────────────────────
 function buildSystemPrompt(role, resumeText) {
