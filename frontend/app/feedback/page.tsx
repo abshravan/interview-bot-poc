@@ -1,14 +1,14 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Star, CheckCircle, TrendingDown, ArrowLeft, RotateCcw, AlertCircle, ChevronRight } from 'lucide-react';
+import { Star, CheckCircle, TrendingDown, ArrowLeft, RotateCcw, AlertCircle, ChevronRight, NotebookPen, Save } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Card, CardContent } from '@/components/ui/card';
-import { getFeedback, getSession } from '@/lib/api';
+import { getFeedback, getSession, saveNotes } from '@/lib/api';
 import ProtectedRoute from '@/components/protected-route';
 
 interface Feedback {
@@ -76,18 +76,40 @@ export default function FeedbackPage() {
   const router = useRouter();
   const sp = useSearchParams();
   const sessionId = sp.get('sessionId');
-  const [fb, setFb]       = useState<Feedback | null>(null);
-  const [role, setRole]   = useState('');
-  const [loading, setLd]  = useState(true);
-  const [error, setErr]   = useState('');
+  const [fb, setFb]             = useState<Feedback | null>(null);
+  const [role, setRole]         = useState('');
+  const [loading, setLd]        = useState(true);
+  const [error, setErr]         = useState('');
+  const [notes, setNotes]       = useState('');
+  const [notesSaved, setNSaved] = useState(false);
+  const [notesSaving, setNSaving] = useState(false);
+  const autoSaveTimer           = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (!sessionId) { setErr('No session ID'); setLd(false); return; }
     Promise.all([getFeedback(sessionId), getSession(sessionId)])
-      .then(([f, s]) => { setFb(f); setRole(s.role); })
+      .then(([f, s]) => { setFb(f); setRole(s.role); setNotes(s.notes ?? ''); })
       .catch((e) => setErr(e.message))
       .finally(() => setLd(false));
   }, [sessionId]);
+
+  function handleNotesChange(val: string) {
+    setNotes(val);
+    setNSaved(false);
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+    autoSaveTimer.current = setTimeout(() => persistNotes(val), 1500);
+  }
+
+  async function persistNotes(val: string) {
+    if (!sessionId) return;
+    setNSaving(true);
+    try {
+      await saveNotes(sessionId, val);
+      setNSaved(true);
+    } finally {
+      setNSaving(false);
+    }
+  }
 
   if (loading) return (
     <div className="min-h-screen bg-benz-black flex items-center justify-center">
@@ -241,13 +263,44 @@ export default function FeedbackPage() {
           </Tabs>
         </div>
 
+        {/* Notes */}
+        <Card className="animate-fade-in-delay3">
+          <CardContent className="py-6">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <NotebookPen size={14} className="text-benz-muted" />
+                <span className="text-xs font-medium text-benz-silver uppercase tracking-[0.1em]">Session Notes</span>
+              </div>
+              <span className="text-[10px] text-benz-muted">
+                {notesSaving ? 'Saving…' : notesSaved ? 'Saved ✓' : notes ? 'Unsaved' : ''}
+              </span>
+            </div>
+            <textarea
+              className="w-full bg-benz-dark border border-benz-border rounded-xl px-4 py-3 text-sm text-benz-chrome placeholder:text-benz-muted/50 focus:outline-none focus:border-benz-border-2 focus:ring-2 focus:ring-benz-silver/10 resize-none transition-all"
+              rows={4}
+              placeholder="Add your personal reflections, things to work on, or anything you want to remember from this session…"
+              value={notes}
+              onChange={(e) => handleNotesChange(e.target.value)}
+            />
+            <div className="flex justify-end mt-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => persistNotes(notes)}
+                disabled={notesSaving || notesSaved}
+                className="gap-1.5"
+              >
+                <Save size={12} />
+                {notesSaving ? 'Saving…' : notesSaved ? 'Saved' : 'Save Notes'}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
         {/* CTAs */}
         <div className="flex gap-3 animate-fade-in-delay3">
           <Button variant="outline" className="flex-1" onClick={() => router.push('/')}>
             <RotateCcw size={14} /> Practice Again
-          </Button>
-          <Button className="flex-1" onClick={() => router.push('/demo')}>
-            View Demo <ChevronRight size={14} />
           </Button>
         </div>
       </div>

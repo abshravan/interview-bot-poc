@@ -38,3 +38,13 @@ export async function getSession(sessionId: string) {
   if (!res.ok) throw new Error((await res.json()).error || 'Session not found');
   return res.json();
 }
+
+export async function saveNotes(sessionId: string, notes: string) {
+  const res = await fetch(`${BASE}/api/sessions/${sessionId}/notes`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ notes }),
+  });
+  if (!res.ok) throw new Error((await res.json()).error || 'Failed to save notes');
+  return res.json();
+}

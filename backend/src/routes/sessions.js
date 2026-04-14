@@ -55,6 +55,25 @@ router.post('/:id/transcript', async (req, res) => {
   }
 });
 
+// PATCH /api/sessions/:id/notes — save personal notes
+router.patch('/:id/notes', async (req, res) => {
+  try {
+    const { notes } = req.body;
+    if (typeof notes !== 'string') {
+      return res.status(400).json({ error: 'notes must be a string' });
+    }
+    const session = await Session.findByIdAndUpdate(
+      req.params.id,
+      { notes },
+      { new: true }
+    );
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PATCH /api/sessions/:id/complete
 router.patch('/:id/complete', async (req, res) => {
   try {

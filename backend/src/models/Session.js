@@ -16,6 +16,7 @@ const sessionSchema = new mongoose.Schema(
       default: 'active',
     },
     transcript: [messageSchema],
+    notes: { type: String, default: '' },
     feedback: {
       strengths: [String],
       weaknesses: [String],
