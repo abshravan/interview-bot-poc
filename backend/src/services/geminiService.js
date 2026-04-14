@@ -1,10 +1,10 @@
 /**
  * Gemini Live — raw WebSocket relay for BidiGenerateContent.
  *
- *   - model:  gemini-3.1-flash-live-preview  (override via GEMINI_LIVE_MODEL env var)
- *   - audio input:  realtimeInput.audio  (NOT realtimeInput.mediaChunks)
- *   - transcripts:  inputAudioTranscription / outputAudioTranscription in setup
- *   - barge-in:     serverContent.interrupted
+ *   - model:   gemini-3.1-flash-live-preview  (override via GEMINI_LIVE_MODEL)
+ *   - input:   realtimeInput.audio (mic) + clientContent (typed text / turn trigger)
+ *   - output:  AUDIO + TEXT modalities — audio played in browser, text used for transcript
+ *   - barge-in: serverContent.interrupted
  */
 
 const WebSocket = require('ws');
@@ -44,7 +44,7 @@ function buildSetupPayload(role, resumeText) {
     setup: {
       model: modelId,
       generationConfig: {
-        responseModalities: ['AUDIO'],
+        responseModalities: ['AUDIO', 'TEXT'],   // TEXT → transcript via modelTurn.parts
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
         },
@@ -52,8 +52,6 @@ function buildSetupPayload(role, resumeText) {
       systemInstruction: {
         parts: [{ text: buildSystemPrompt(role, resumeText) }],
       },
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
     },
   };
 }
@@ -120,22 +118,32 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(raw.toString()); }
     catch { return; }
 
-    // 1. setupComplete ACK — trigger the AI greeting then open the mic.
-    //    Use realtimeInput.text (not clientContent) because clientContent is
-    //    incompatible with audio-only response mode and causes a 1007.
-    //    Discard any audio queued before setup completed (stale mic data).
+    // 1. setupComplete — drop stale audio, send clientContent turn to start interview.
+    //    clientContent with turnComplete:true is the documented trigger (Python SDK uses it).
+    //    The previous 1007 was from flushing audio simultaneously — now we clear it.
     if (msg.setupComplete !== undefined) {
       setupComplete = true;
-      audioQueue.length = 0;   // drop stale pre-setup mic chunks
-      console.log('[gemini] Setup complete ✓ — sending start trigger via realtimeInput');
-      sendToGemini({ realtimeInput: { text: 'Please begin the interview now.' } });
+      audioQueue.length = 0;
+      console.log('[gemini] Setup complete ✓ — triggering opening question');
+      sendToGemini({
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: 'Begin the interview.' }] }],
+          turnComplete: true,
+        },
+      });
       return;
+    }
+
+    // Log all non-audio Gemini messages for visibility
+    const preview = JSON.stringify(msg);
+    if (!preview.includes('"inlineData"') && !preview.includes('"inline_data"')) {
+      console.log('[gemini] ←', preview.slice(0, 300));
     }
 
     const sc = msg.serverContent;
     if (!sc) return;
 
-    // 2. Barge-in / interrupted (user spoke while AI was talking)
+    // 2. Barge-in / interrupted
     if (sc.interrupted) {
       outputTranscript = '';
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -143,28 +151,22 @@ async function handleInterviewSocket(clientWs, sessionId) {
       }
     }
 
-    // 3. User speech transcript (accumulates during turn)
-    if (sc.inputTranscription?.text) {
-      inputTranscript = sc.inputTranscription.text;
-    }
-
-    // 4. AI speech transcript (accumulates during turn)
-    if (sc.outputTranscription?.text) {
-      outputTranscript = sc.outputTranscription.text;
-    }
-
-    // 5. AI audio chunks → forward to browser for playback
+    // 3. Model turn parts — audio to browser, text to transcript accumulator
     if (sc.modelTurn?.parts) {
       for (const part of sc.modelTurn.parts) {
         const inline = part.inlineData || part.inline_data;
-        if (!inline?.data) continue;
-        if (clientWs.readyState === WebSocket.OPEN) {
+        if (inline?.data && clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: 'audio', data: inline.data }));
         }
+        if (part.text) outputTranscript += part.text;
       }
     }
 
-    // 6. Turn complete — emit transcripts then signal UI
+    // 4. Fallback: transcription fields (older model variants)
+    if (sc.inputTranscription?.text)  inputTranscript  = sc.inputTranscription.text;
+    if (sc.outputTranscription?.text) outputTranscript = sc.outputTranscription.text;
+
+    // 5. Turn complete — persist transcripts and signal UI
     if (sc.turnComplete) {
       const userText = inputTranscript.trim();
       const aiText   = outputTranscript.trim();
