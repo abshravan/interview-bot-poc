@@ -231,7 +231,26 @@ async function handleInterviewSocket(clientWs, sessionId) {
   geminiWs.on('close', (code, reasonBuf) => {
     const reason = reasonBuf?.toString() || '(no reason)';
     console.log(`[gemini] WS closed — code: ${code}  reason: ${reason}`);
-    // Fallback on any error close (before OR after setup)
+
+    // Model not found — query the REST API and log valid bidiGenerateContent models
+    if (code === 1008) {
+      fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=100`)
+        .then((r) => r.json())
+        .then((data) => {
+          const live = (data.models || []).filter((m) =>
+            (m.supportedGenerationMethods || []).includes('bidiGenerateContent')
+          );
+          if (live.length) {
+            console.log('\n[gemini] Models that support bidiGenerateContent on your API key:');
+            live.forEach((m) => console.log('  ·', m.name));
+            console.log('[gemini] → Set GEMINI_LIVE_MODEL=<name> in backend/.env (without the "models/" prefix)\n');
+          } else {
+            console.log('[gemini] No bidiGenerateContent models found — Live API may not be enabled for your key.');
+          }
+        })
+        .catch(() => {});
+    }
+
     const isErrorClose = code !== 1000 && code !== 1001;
     if (!setupComplete || isErrorClose) {
       fallbackToMock(`WS closed ${code}: ${reason}`);
