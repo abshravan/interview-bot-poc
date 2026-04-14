@@ -32,13 +32,15 @@ function validateUri(uri) {
   }
 }
 
+let dbConnected = false;
+
 async function connectDB() {
   const uri = process.env.MONGODB_URI;
 
   validateUri(uri);
 
-  mongoose.connection.on('connected',    () => console.log('[db] MongoDB connected ✓'));
-  mongoose.connection.on('disconnected', () => console.warn('[db] MongoDB disconnected'));
+  mongoose.connection.on('connected',    () => { dbConnected = true;  console.log('[db] MongoDB connected ✓'); });
+  mongoose.connection.on('disconnected', () => { dbConnected = false; console.warn('[db] MongoDB disconnected'); });
   mongoose.connection.on('error',        (err) => console.error('[db] MongoDB error:', err.message));
 
   await mongoose.connect(uri, {
@@ -48,4 +50,6 @@ async function connectDB() {
   });
 }
 
-module.exports = { connectDB };
+function isDbConnected() { return dbConnected; }
+
+module.exports = { connectDB, isDbConnected };

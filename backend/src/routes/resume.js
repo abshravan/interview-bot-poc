@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
-const Resume = require('../models/Resume');
+const { Resume } = require('../lib/store');
 
 const router = express.Router();
 

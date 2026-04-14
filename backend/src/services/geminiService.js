@@ -8,13 +8,13 @@
  */
 
 const WebSocket = require('ws');
-const Session   = require('../models/Session');
+const { Session } = require('../lib/store');
 
 const GEMINI_WS_URL =
   'wss://generativelanguage.googleapis.com/ws/' +
   'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
-const DEFAULT_MODEL = 'gemini-3.1-flash-live-preview';
+const DEFAULT_MODEL = 'gemini-2.0-flash-live-001';
 
 // ── Prompt ─────────────────────────────────────────────────────────────────────
 function buildSystemPrompt(role, resumeText) {
@@ -73,8 +73,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
     if (!dbSession) { clientWs.close(1008, 'Session not found'); return; }
   } catch (err) {
     console.error('[gemini] DB error:', err.message);
-    clientWs.close(1011, 'DB error');
-    return;
+    return handleMockInterview(clientWs, sessionId);
   }
 
   const setupPayload = buildSetupPayload(dbSession.role, dbSession.resumeId.text);
@@ -121,14 +120,19 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(raw.toString()); }
     catch { return; }
 
-    // 1. setupComplete ACK — flush queued audio
+    // 1. setupComplete ACK — send initial trigger so the AI starts the interview,
+    //    then flush any audio that arrived before setup finished.
     if (msg.setupComplete !== undefined) {
       setupComplete = true;
-      console.log(`[gemini] Setup complete ✓ — flushing ${audioQueue.length} queued chunk(s)`);
+      console.log('[gemini] Setup complete ✓ — sending interview start trigger');
+      sendToGemini({
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: 'Please begin the interview now.' }] }],
+          turnComplete: true,
+        },
+      });
       while (audioQueue.length && geminiWs.readyState === WebSocket.OPEN) {
-        const queued = audioQueue.shift();
-        console.log('[gemini] → (queued)', queued.slice(0, 200));
-        geminiWs.send(queued);
+        geminiWs.send(audioQueue.shift());
       }
       return;
     }

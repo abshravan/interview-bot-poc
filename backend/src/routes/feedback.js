@@ -1,5 +1,5 @@
 const express = require('express');
-const Session = require('../models/Session');
+const { Session } = require('../lib/store');
 const { generateFeedback } = require('../services/feedbackService');
 
 const router = express.Router();

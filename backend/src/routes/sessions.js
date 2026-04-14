@@ -1,7 +1,5 @@
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
-const Session = require('../models/Session');
-const Resume = require('../models/Resume');
+const { Resume, Session } = require('../lib/store');
 
 const router = express.Router();
 
