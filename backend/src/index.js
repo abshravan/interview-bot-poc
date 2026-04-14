@@ -78,6 +78,9 @@ connectDB()
     server.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
   })
   .catch((err) => {
-    console.error('Failed to connect to MongoDB:', err.message);
-    process.exit(1);
+    console.warn('\n⚠️  MongoDB unavailable:', err.message);
+    console.warn('   Sessions and feedback will not persist.');
+    console.warn('   Fill in MONGODB_URI in backend/.env to enable full functionality.\n');
+    // Start anyway so mock interview mode still works
+    server.listen(PORT, () => console.log(`Backend running on port ${PORT} (no-DB mode)`));
   });

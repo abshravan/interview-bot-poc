@@ -1,11 +1,9 @@
 /**
  * Gemini Live — raw WebSocket relay for BidiGenerateContent.
  *
- * Modelled on the Python phase7 Gemini client:
  *   - model:  gemini-3.1-flash-live-preview  (override via GEMINI_LIVE_MODEL env var)
  *   - audio input:  realtimeInput.audio  (NOT realtimeInput.mediaChunks)
  *   - transcripts:  inputAudioTranscription / outputAudioTranscription in setup
- *   - VAD:          realtimeInputConfig.automaticActivityDetection
  *   - barge-in:     serverContent.interrupted
  */
 
@@ -56,15 +54,6 @@ function buildSetupPayload(role, resumeText) {
       },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          disabled: false,
-          startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
-          endOfSpeechSensitivity:   'END_SENSITIVITY_LOW',
-          prefixPaddingMs:  300,
-          silenceDurationMs: 1000,
-        },
-      },
     },
   };
 }
