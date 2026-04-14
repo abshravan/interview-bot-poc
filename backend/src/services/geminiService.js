@@ -44,14 +44,15 @@ function buildSetupPayload(role, resumeText) {
     setup: {
       model: modelId,
       generationConfig: {
-        responseModalities: ['AUDIO', 'TEXT'],   // TEXT → transcript via modelTurn.parts
+        responseModalities: ['AUDIO'],
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
         },
       },
       systemInstruction: {
-        parts: [{ text: buildSystemPrompt(role, resumeText) }],
+        parts: [{ text: buildSystemPrompt(role, resumeText.slice(0, 3000)) }],
       },
+      outputAudioTranscription: {},   // get AI speech-to-text via sc.outputTranscription
     },
   };
 }
@@ -151,18 +152,18 @@ async function handleInterviewSocket(clientWs, sessionId) {
       }
     }
 
-    // 3. Model turn parts — audio to browser, text to transcript accumulator
+    // 3. Model turn parts — forward audio chunks to browser
     if (sc.modelTurn?.parts) {
       for (const part of sc.modelTurn.parts) {
         const inline = part.inlineData || part.inline_data;
         if (inline?.data && clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: 'audio', data: inline.data }));
         }
-        if (part.text) outputTranscript += part.text;
+        if (part.text) outputTranscript += part.text;   // TEXT modality fallback
       }
     }
 
-    // 4. Fallback: transcription fields (older model variants)
+    // 4. Transcription fields (outputAudioTranscription in setup → sc.outputTranscription)
     if (sc.inputTranscription?.text)  inputTranscript  = sc.inputTranscription.text;
     if (sc.outputTranscription?.text) outputTranscript = sc.outputTranscription.text;
 
