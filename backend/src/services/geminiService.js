@@ -120,20 +120,15 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(raw.toString()); }
     catch { return; }
 
-    // 1. setupComplete ACK — send initial trigger so the AI starts the interview,
-    //    then flush any audio that arrived before setup finished.
+    // 1. setupComplete ACK — trigger the AI greeting then open the mic.
+    //    Use realtimeInput.text (not clientContent) because clientContent is
+    //    incompatible with audio-only response mode and causes a 1007.
+    //    Discard any audio queued before setup completed (stale mic data).
     if (msg.setupComplete !== undefined) {
       setupComplete = true;
-      console.log('[gemini] Setup complete ✓ — sending interview start trigger');
-      sendToGemini({
-        clientContent: {
-          turns: [{ role: 'user', parts: [{ text: 'Please begin the interview now.' }] }],
-          turnComplete: true,
-        },
-      });
-      while (audioQueue.length && geminiWs.readyState === WebSocket.OPEN) {
-        geminiWs.send(audioQueue.shift());
-      }
+      audioQueue.length = 0;   // drop stale pre-setup mic chunks
+      console.log('[gemini] Setup complete ✓ — sending start trigger via realtimeInput');
+      sendToGemini({ realtimeInput: { text: 'Please begin the interview now.' } });
       return;
     }
 
