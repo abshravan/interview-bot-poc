@@ -10,9 +10,11 @@
 const WebSocket = require('ws');
 const { Session } = require('../lib/store');
 
+// v1alpha is required: v1beta rejects clientContent with 1007 and
+// does not support manual activityEnd with auto-VAD enabled.
 const GEMINI_WS_URL =
   'wss://generativelanguage.googleapis.com/ws/' +
-  'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+  'google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent';
 
 const DEFAULT_MODEL = 'gemini-3.0-flash-live';
 
@@ -68,7 +70,10 @@ async function handleInterviewSocket(clientWs, sessionId) {
   let dbSession;
   try {
     dbSession = await Session.findById(sessionId).populate('resumeId');
-    if (!dbSession) { clientWs.close(1008, 'Session not found'); return; }
+    if (!dbSession) {
+      console.warn('[gemini] Session not found, falling back to mock');
+      return handleMockInterview(clientWs, sessionId);
+    }
   } catch (err) {
     console.error('[gemini] DB error:', err.message);
     return handleMockInterview(clientWs, sessionId);
@@ -118,16 +123,19 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(raw.toString()); }
     catch { return; }
 
-    // 1. setupComplete — drop stale audio, then trigger with realtimeInput.text +
-    //    activityEnd.  clientContent is rejected (1007) in audio-only sessions;
-    //    the correct text-turn pattern is text followed by activityEnd which tells
-    //    the model "user is done speaking" and causes it to generate a response.
+    // 1. setupComplete — drop stale audio, send clientContent turn trigger.
+    //    clientContent with turnComplete:true is the standard trigger (Python SDK).
+    //    Works on v1alpha; v1beta was rejecting it with 1007.
     if (msg.setupComplete !== undefined) {
       setupComplete = true;
       audioQueue.length = 0;
-      console.log('[gemini] Setup complete ✓ — sending start trigger');
-      sendToGemini({ realtimeInput: { text: 'Begin the interview.' } });
-      sendToGemini({ realtimeInput: { activityEnd: {} } });
+      console.log('[gemini] Setup complete ✓ — sending interview start trigger');
+      sendToGemini({
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: 'Begin the interview.' }] }],
+          turnComplete: true,
+        },
+      });
       return;
     }
 
@@ -208,8 +216,12 @@ async function handleInterviewSocket(clientWs, sessionId) {
     if (msg.type === 'text') {
       await appendTranscript(sessionId, 'candidate', msg.content);
       if (geminiWs.readyState === WebSocket.OPEN) {
-        sendToGemini({ realtimeInput: { text: msg.content } });
-        sendToGemini({ realtimeInput: { activityEnd: {} } });
+        sendToGemini({
+          clientContent: {
+            turns: [{ role: 'user', parts: [{ text: msg.content }] }],
+            turnComplete: true,
+          },
+        });
       }
     }
 
@@ -281,16 +293,21 @@ function handleMockInterview(clientWs, sessionId) {
   let questionIndex = 0;
   let autoTimer     = null;
 
+  const send = (obj) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify(obj));
+  };
+
   const sendNext = () => {
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    if (clientWs.readyState !== WebSocket.OPEN) return;
     if (questionIndex >= MOCK_QUESTIONS.length) {
-      clientWs.send(JSON.stringify({ type: 'interviewEnd' }));
+      send({ type: 'interviewEnd' });
       return;
     }
     const content = MOCK_QUESTIONS[questionIndex++];
     appendTranscript(sessionId, 'interviewer', content);
-    clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content }));
-    clientWs.send(JSON.stringify({ type: 'turnComplete' }));
+    send({ type: 'text', role: 'interviewer', content });
+    send({ type: 'turnComplete' });
     autoTimer = setTimeout(sendNext, MOCK_QUESTION_WINDOW);
   };
 
