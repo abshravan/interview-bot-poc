@@ -52,7 +52,6 @@ function buildSetupPayload(role, resumeText) {
       systemInstruction: {
         parts: [{ text: buildSystemPrompt(role, resumeText.slice(0, 3000)) }],
       },
-      outputAudioTranscription: {},   // get AI speech-to-text via sc.outputTranscription
     },
   };
 }
@@ -119,19 +118,16 @@ async function handleInterviewSocket(clientWs, sessionId) {
     try { msg = JSON.parse(raw.toString()); }
     catch { return; }
 
-    // 1. setupComplete — drop stale audio, send clientContent turn to start interview.
-    //    clientContent with turnComplete:true is the documented trigger (Python SDK uses it).
-    //    The previous 1007 was from flushing audio simultaneously — now we clear it.
+    // 1. setupComplete — drop stale audio, then trigger with realtimeInput.text +
+    //    activityEnd.  clientContent is rejected (1007) in audio-only sessions;
+    //    the correct text-turn pattern is text followed by activityEnd which tells
+    //    the model "user is done speaking" and causes it to generate a response.
     if (msg.setupComplete !== undefined) {
       setupComplete = true;
       audioQueue.length = 0;
-      console.log('[gemini] Setup complete ✓ — triggering opening question');
-      sendToGemini({
-        clientContent: {
-          turns: [{ role: 'user', parts: [{ text: 'Begin the interview.' }] }],
-          turnComplete: true,
-        },
-      });
+      console.log('[gemini] Setup complete ✓ — sending start trigger');
+      sendToGemini({ realtimeInput: { text: 'Begin the interview.' } });
+      sendToGemini({ realtimeInput: { activityEnd: {} } });
       return;
     }
 
@@ -212,12 +208,8 @@ async function handleInterviewSocket(clientWs, sessionId) {
     if (msg.type === 'text') {
       await appendTranscript(sessionId, 'candidate', msg.content);
       if (geminiWs.readyState === WebSocket.OPEN) {
-        sendToGemini({
-          clientContent: {
-            turns: [{ role: 'user', parts: [{ text: msg.content }] }],
-            turnComplete: true,
-          },
-        });
+        sendToGemini({ realtimeInput: { text: msg.content } });
+        sendToGemini({ realtimeInput: { activityEnd: {} } });
       }
     }
 
