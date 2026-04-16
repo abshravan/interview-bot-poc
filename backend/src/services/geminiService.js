@@ -1,22 +1,19 @@
 /**
- * Gemini Live — raw WebSocket relay for BidiGenerateContent.
+ * Gemini Live — uses @google/genai SDK for BidiGenerateContent.
  *
- *   - model:   gemini-3.1-flash-live-preview  (override via GEMINI_LIVE_MODEL)
- *   - input:   realtimeInput.audio (mic) + clientContent (typed text / turn trigger)
- *   - output:  AUDIO + TEXT modalities — audio played in browser, text used for transcript
+ *   - model:   gemini-2.0-flash-live-001  (override via GEMINI_LIVE_MODEL)
+ *   - input:   sendRealtimeInput (mic audio) + sendClientContent (typed text)
+ *   - output:  AUDIO modality — audio played in browser, text used for transcript
  *   - barge-in: serverContent.interrupted
+ *
+ * Uses v1alpha so that sendClientContent works as a turn trigger.
  */
 
+const { GoogleGenAI, Modality } = require('@google/genai');
 const WebSocket = require('ws');
 const { Session } = require('../lib/store');
 
-// v1alpha is required: v1beta rejects clientContent with 1007 and
-// does not support manual activityEnd with auto-VAD enabled.
-const GEMINI_WS_URL =
-  'wss://generativelanguage.googleapis.com/ws/' +
-  'google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent';
-
-const DEFAULT_MODEL = 'gemini-3.0-flash-live';
+const DEFAULT_MODEL = 'gemini-2.0-flash-live-001';
 
 // ── Prompt ─────────────────────────────────────────────────────────────────────
 function buildSystemPrompt(role, resumeText) {
@@ -37,27 +34,6 @@ Rules:
 - After 4–5 questions wrap up politely`;
 }
 
-// ── Setup payload (matches Python _build_setup) ────────────────────────────────
-function buildSetupPayload(role, resumeText) {
-  const rawModel = (process.env.GEMINI_LIVE_MODEL || DEFAULT_MODEL).trim();
-  const modelId  = rawModel.startsWith('models/') ? rawModel : `models/${rawModel}`;
-
-  return {
-    setup: {
-      model: modelId,
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
-        },
-      },
-      systemInstruction: {
-        parts: [{ text: buildSystemPrompt(role, resumeText.slice(0, 3000)) }],
-      },
-    },
-  };
-}
-
 // ── Main handler ───────────────────────────────────────────────────────────────
 async function handleInterviewSocket(clientWs, sessionId) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -65,6 +41,9 @@ async function handleInterviewSocket(clientWs, sessionId) {
     console.warn('[gemini] No API key — mock interview mode');
     return handleMockInterview(clientWs, sessionId);
   }
+
+  // Prevent unhandled 'error' events from crashing the Node process
+  clientWs.on('error', (err) => console.error('[gemini] clientWs error:', err.message));
 
   // Load session + resume
   let dbSession;
@@ -79,17 +58,21 @@ async function handleInterviewSocket(clientWs, sessionId) {
     return handleMockInterview(clientWs, sessionId);
   }
 
-  const setupPayload = buildSetupPayload(dbSession.role, dbSession.resumeId.text);
-  const geminiWs     = new WebSocket(`${GEMINI_WS_URL}?key=${apiKey}`);
+  const rawModel = (process.env.GEMINI_LIVE_MODEL || DEFAULT_MODEL).trim();
+  // SDK expects the short name without "models/" prefix
+  const modelId  = rawModel.startsWith('models/') ? rawModel.slice(7) : rawModel;
 
-  let setupComplete = false;
-  const audioQueue  = [];   // hold audio until setupComplete
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: { apiVersion: 'v1alpha' },
+  });
 
-  // Per-turn transcript accumulators (mirrors Python _GeminiTurnState)
+  // Per-turn transcript accumulators
   let inputTranscript  = '';
   let outputTranscript = '';
+  let liveSession      = null;
+  let fellBack         = false;
 
-  let fellBack = false;
   function fallbackToMock(reason) {
     if (fellBack) return;
     fellBack = true;
@@ -103,43 +86,22 @@ async function handleInterviewSocket(clientWs, sessionId) {
     }
   }
 
-  // ── Gemini WS open → send setup ─────────────────────────────────────────────
-  // Helper: log + send every outgoing message to Gemini
-  function sendToGemini(payload) {
-    const str = JSON.stringify(payload);
-    console.log('[gemini] →', str.slice(0, 200));
-    geminiWs.send(str);
-  }
-
-  geminiWs.on('open', () => {
-    const modelId = (process.env.GEMINI_LIVE_MODEL || DEFAULT_MODEL).trim();
-    console.log(`[gemini] WS open — setup for model: ${modelId}`);
-    sendToGemini(setupPayload);
-  });
-
-  // ── Gemini → browser ────────────────────────────────────────────────────────
-  geminiWs.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); }
-    catch { return; }
-
-    // 1. setupComplete — drop stale audio, send clientContent turn trigger.
-    //    clientContent with turnComplete:true is the standard trigger (Python SDK).
-    //    Works on v1alpha; v1beta was rejecting it with 1007.
+  // ── Message handler ────────────────────────────────────────────────────────
+  function handleMessage(msg) {
+    // 1. setupComplete — signal the model to start the interview.
+    //    Send a bare turnComplete (no turns array) — tells Gemini "your turn, go ahead".
     if (msg.setupComplete !== undefined) {
-      setupComplete = true;
-      audioQueue.length = 0;
-      console.log('[gemini] Setup complete ✓ — sending interview start trigger');
-      sendToGemini({
-        clientContent: {
-          turns: [{ role: 'user', parts: [{ text: 'Begin the interview.' }] }],
-          turnComplete: true,
-        },
-      });
+      console.log('[gemini] Setup complete ✓ — sending turn trigger');
+      try {
+        liveSession.sendClientContent({ turnComplete: true });
+      } catch (e) {
+        console.error('[gemini] Trigger send failed:', e.message);
+        fallbackToMock('trigger failed: ' + e.message);
+      }
       return;
     }
 
-    // Log all non-audio Gemini messages for visibility
+    // Log non-audio messages for visibility
     const preview = JSON.stringify(msg);
     if (!preview.includes('"inlineData"') && !preview.includes('"inline_data"')) {
       console.log('[gemini] ←', preview.slice(0, 300));
@@ -148,7 +110,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
     const sc = msg.serverContent;
     if (!sc) return;
 
-    // 2. Barge-in / interrupted
+    // 2. Barge-in
     if (sc.interrupted) {
       outputTranscript = '';
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -156,34 +118,34 @@ async function handleInterviewSocket(clientWs, sessionId) {
       }
     }
 
-    // 3. Model turn parts — forward audio chunks to browser
+    // 3. Model turn parts — forward audio to browser
     if (sc.modelTurn?.parts) {
       for (const part of sc.modelTurn.parts) {
         const inline = part.inlineData || part.inline_data;
         if (inline?.data && clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: 'audio', data: inline.data }));
         }
-        if (part.text) outputTranscript += part.text;   // TEXT modality fallback
+        if (part.text) outputTranscript += part.text;  // TEXT modality fallback
       }
     }
 
-    // 4. Transcription fields (outputAudioTranscription in setup → sc.outputTranscription)
+    // 4. Transcription fields
     if (sc.inputTranscription?.text)  inputTranscript  = sc.inputTranscription.text;
     if (sc.outputTranscription?.text) outputTranscript = sc.outputTranscription.text;
 
-    // 5. Turn complete — persist transcripts and signal UI
+    // 5. Turn complete — persist and signal UI
     if (sc.turnComplete) {
       const userText = inputTranscript.trim();
       const aiText   = outputTranscript.trim();
 
       if (userText) {
-        await appendTranscript(sessionId, 'candidate', userText);
+        appendTranscript(sessionId, 'candidate', userText);
         if (clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: 'text', role: 'candidate', content: userText }));
         }
       }
       if (aiText) {
-        await appendTranscript(sessionId, 'interviewer', aiText);
+        appendTranscript(sessionId, 'interviewer', aiText);
         if (clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: 'text', role: 'interviewer', content: aiText }));
         }
@@ -192,78 +154,107 @@ async function handleInterviewSocket(clientWs, sessionId) {
         clientWs.send(JSON.stringify({ type: 'turnComplete' }));
       }
 
-      // Reset accumulators for next turn
       inputTranscript  = '';
       outputTranscript = '';
     }
-  });
+  }
+
+  // ── Connect to Gemini Live via SDK ─────────────────────────────────────────
+  try {
+    liveSession = await ai.live.connect({
+      model: modelId,
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
+        },
+        systemInstruction: buildSystemPrompt(
+          dbSession.role,
+          dbSession.resumeId.text.slice(0, 3000)
+        ),
+      },
+      callbacks: {
+        onopen: () => console.log(`[gemini] SDK session open — model: ${modelId}`),
+        onmessage: (msg) => {
+          try { handleMessage(msg); }
+          catch (e) { console.error('[gemini] handleMessage error:', e.message); }
+        },
+        onerror: (e) => {
+          console.error('[gemini] SDK WS error:', e);
+          fallbackToMock('WS error');
+        },
+        onclose: (e) => {
+          const code   = e?.code;
+          const reason = e?.reason || '(none)';
+          console.log(`[gemini] SDK session closed — code: ${code}  reason: ${reason}`);
+
+          // On model-not-found, list available Live models
+          if (code === 1008) {
+            fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=100`)
+              .then((r) => r.json())
+              .then((data) => {
+                const live = (data.models || []).filter((m) =>
+                  (m.supportedGenerationMethods || []).includes('bidiGenerateContent')
+                );
+                if (live.length) {
+                  console.log('\n[gemini] Models supporting bidiGenerateContent on your key:');
+                  live.forEach((m) => console.log('  ·', m.name));
+                  console.log('[gemini] → Set GEMINI_LIVE_MODEL=<name> in backend/.env\n');
+                }
+              })
+              .catch(() => {});
+          }
+
+          const isErrorClose = code !== 1000 && code !== 1001;
+          if (isErrorClose) {
+            fallbackToMock(`WS closed ${code}: ${reason}`);
+          } else if (!fellBack && clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close();
+          }
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[gemini] Failed to connect to Live API:', err.message);
+    fallbackToMock(err.message);
+    return;
+  }
 
   // ── Browser → Gemini ────────────────────────────────────────────────────────
   clientWs.on('message', async (data) => {
-    if (fellBack) return;
+    if (fellBack || !liveSession) return;
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.type === 'audio') {
-      const audioObj = { realtimeInput: { audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' } } };
-      if (!setupComplete) {
-        audioQueue.push(JSON.stringify(audioObj));
-      } else if (geminiWs.readyState === WebSocket.OPEN) {
-        sendToGemini(audioObj);
+      try {
+        liveSession.sendRealtimeInput({
+          audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
+        });
+      } catch (e) {
+        console.error('[gemini] sendRealtimeInput error:', e.message);
       }
     }
 
     if (msg.type === 'text') {
       await appendTranscript(sessionId, 'candidate', msg.content);
-      if (geminiWs.readyState === WebSocket.OPEN) {
-        sendToGemini({
-          clientContent: {
-            turns: [{ role: 'user', parts: [{ text: msg.content }] }],
-            turnComplete: true,
-          },
+      try {
+        liveSession.sendClientContent({
+          turns: [{ role: 'user', parts: [{ text: msg.content }] }],
+          turnComplete: true,
         });
+      } catch (e) {
+        console.error('[gemini] sendClientContent error:', e.message);
       }
     }
 
-    if (msg.type === 'end') geminiWs.close();
-  });
-
-  clientWs.on('close', () => geminiWs.close());
-
-  geminiWs.on('close', (code, reasonBuf) => {
-    const reason = reasonBuf?.toString() || '(no reason)';
-    console.log(`[gemini] WS closed — code: ${code}  reason: ${reason}`);
-
-    // Model not found — query the REST API and log valid bidiGenerateContent models
-    if (code === 1008) {
-      fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=100`)
-        .then((r) => r.json())
-        .then((data) => {
-          const live = (data.models || []).filter((m) =>
-            (m.supportedGenerationMethods || []).includes('bidiGenerateContent')
-          );
-          if (live.length) {
-            console.log('\n[gemini] Models that support bidiGenerateContent on your API key:');
-            live.forEach((m) => console.log('  ·', m.name));
-            console.log('[gemini] → Set GEMINI_LIVE_MODEL=<name> in backend/.env (without the "models/" prefix)\n');
-          } else {
-            console.log('[gemini] No bidiGenerateContent models found — Live API may not be enabled for your key.');
-          }
-        })
-        .catch(() => {});
-    }
-
-    const isErrorClose = code !== 1000 && code !== 1001;
-    if (!setupComplete || isErrorClose) {
-      fallbackToMock(`WS closed ${code}: ${reason}`);
-    } else if (!fellBack && clientWs.readyState === WebSocket.OPEN) {
-      clientWs.close();
+    if (msg.type === 'end') {
+      try { liveSession.close?.(); } catch {}
     }
   });
 
-  geminiWs.on('error', (err) => {
-    console.error('[gemini] WS error:', err.message);
-    fallbackToMock(err.message);
+  clientWs.on('close', () => {
+    try { liveSession?.close?.(); } catch {}
   });
 }
 
@@ -326,7 +317,7 @@ function handleMockInterview(clientWs, sessionId) {
         clientWs.close();
       }
     } catch (e) {
-      console.error('[mock] WS error:', e.message);
+      console.error('[mock] message error:', e.message);
     }
   });
 }
