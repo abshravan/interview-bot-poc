@@ -5,8 +5,6 @@
  *   - input:   sendRealtimeInput (mic audio) + sendClientContent (typed text)
  *   - output:  AUDIO modality — audio played in browser, text used for transcript
  *   - barge-in: serverContent.interrupted
- *
- * Uses v1alpha so that sendClientContent works as a turn trigger.
  */
 
 const { GoogleGenAI, Modality } = require('@google/genai');
@@ -36,26 +34,27 @@ Rules:
 
 // ── Main handler ───────────────────────────────────────────────────────────────
 async function handleInterviewSocket(clientWs, sessionId) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'your_gemini_api_key_here') {
-    console.warn('[gemini] No API key — mock interview mode');
-    return handleMockInterview(clientWs, sessionId);
-  }
-
   // Prevent unhandled 'error' events from crashing the Node process
   clientWs.on('error', (err) => console.error('[gemini] clientWs error:', err.message));
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'your_gemini_api_key_here') {
+    clientWs.close(1011, 'GEMINI_API_KEY is not configured');
+    return;
+  }
 
   // Load session + resume
   let dbSession;
   try {
     dbSession = await Session.findById(sessionId).populate('resumeId');
     if (!dbSession) {
-      console.warn('[gemini] Session not found, falling back to mock');
-      return handleMockInterview(clientWs, sessionId);
+      clientWs.close(1011, 'Session not found');
+      return;
     }
   } catch (err) {
     console.error('[gemini] DB error:', err.message);
-    return handleMockInterview(clientWs, sessionId);
+    clientWs.close(1011, 'Database error');
+    return;
   }
 
   const rawModel = (process.env.GEMINI_LIVE_MODEL || DEFAULT_MODEL).trim();
@@ -71,20 +70,6 @@ async function handleInterviewSocket(clientWs, sessionId) {
   let inputTranscript  = '';
   let outputTranscript = '';
   let liveSession      = null;
-  let fellBack         = false;
-
-  function fallbackToMock(reason) {
-    if (fellBack) return;
-    fellBack = true;
-    console.warn(`[gemini] Falling back to mock mode — ${reason}`);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify({
-        type: 'text', role: 'interviewer',
-        content: `[Demo mode — ${reason}]`,
-      }));
-      handleMockInterview(clientWs, sessionId);
-    }
-  }
 
   // ── Message handler ────────────────────────────────────────────────────────
   function handleMessage(msg) {
@@ -92,12 +77,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
     //    Send a bare turnComplete (no turns array) — tells Gemini "your turn, go ahead".
     if (msg.setupComplete !== undefined) {
       console.log('[gemini] Setup complete ✓ — sending turn trigger');
-      try {
-        liveSession.sendClientContent({ turnComplete: true });
-      } catch (e) {
-        console.error('[gemini] Trigger send failed:', e.message);
-        fallbackToMock('trigger failed: ' + e.message);
-      }
+      liveSession.sendClientContent({ turnComplete: true });
       return;
     }
 
@@ -125,7 +105,7 @@ async function handleInterviewSocket(clientWs, sessionId) {
         if (inline?.data && clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: 'audio', data: inline.data }));
         }
-        if (part.text) outputTranscript += part.text;  // TEXT modality fallback
+        if (part.text) outputTranscript += part.text;
       }
     }
 
@@ -181,14 +161,16 @@ async function handleInterviewSocket(clientWs, sessionId) {
         },
         onerror: (e) => {
           console.error('[gemini] SDK WS error:', e);
-          fallbackToMock('WS error');
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close(1011, 'Gemini connection error');
+          }
         },
         onclose: (e) => {
           const code   = e?.code;
           const reason = e?.reason || '(none)';
           console.log(`[gemini] SDK session closed — code: ${code}  reason: ${reason}`);
 
-          // On model-not-found, list available Live models
+          // On model-not-found, list available Live models to help with configuration
           if (code === 1008) {
             fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=100`)
               .then((r) => r.json())
@@ -206,9 +188,9 @@ async function handleInterviewSocket(clientWs, sessionId) {
           }
 
           const isErrorClose = code !== 1000 && code !== 1001;
-          if (isErrorClose) {
-            fallbackToMock(`WS closed ${code}: ${reason}`);
-          } else if (!fellBack && clientWs.readyState === WebSocket.OPEN) {
+          if (isErrorClose && clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close(1011, `Gemini session closed: ${code}`);
+          } else if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.close();
           }
         },
@@ -216,13 +198,15 @@ async function handleInterviewSocket(clientWs, sessionId) {
     });
   } catch (err) {
     console.error('[gemini] Failed to connect to Live API:', err.message);
-    fallbackToMock(err.message);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.close(1011, err.message);
+    }
     return;
   }
 
   // ── Browser → Gemini ────────────────────────────────────────────────────────
   clientWs.on('message', async (data) => {
-    if (fellBack || !liveSession) return;
+    if (!liveSession) return;
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
@@ -267,59 +251,6 @@ async function appendTranscript(sessionId, role, content) {
   } catch (e) {
     console.error('[gemini] Failed to append transcript:', e.message);
   }
-}
-
-// ── Mock interview ─────────────────────────────────────────────────────────────
-const MOCK_QUESTIONS = [
-  "Hello! I'm your AI interviewer. Let's get started — can you briefly introduce yourself and walk me through your background?",
-  "Great! Can you describe a challenging technical problem you've solved recently and how you approached it?",
-  "How do you approach debugging a complex issue in a production system?",
-  "Tell me about a time you worked with a team under pressure. How did you handle it?",
-  "What aspects of this role excite you most, and how does it align with your career goals?",
-];
-
-const MOCK_QUESTION_WINDOW = 12000;
-
-function handleMockInterview(clientWs, sessionId) {
-  let questionIndex = 0;
-  let autoTimer     = null;
-
-  const send = (obj) => {
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify(obj));
-  };
-
-  const sendNext = () => {
-    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-    if (clientWs.readyState !== WebSocket.OPEN) return;
-    if (questionIndex >= MOCK_QUESTIONS.length) {
-      send({ type: 'interviewEnd' });
-      return;
-    }
-    const content = MOCK_QUESTIONS[questionIndex++];
-    appendTranscript(sessionId, 'interviewer', content);
-    send({ type: 'text', role: 'interviewer', content });
-    send({ type: 'turnComplete' });
-    autoTimer = setTimeout(sendNext, MOCK_QUESTION_WINDOW);
-  };
-
-  setTimeout(sendNext, 1000);
-
-  clientWs.on('message', async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'text' && msg.content?.trim()) {
-        await appendTranscript(sessionId, 'candidate', msg.content);
-        if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-        setTimeout(sendNext, 1500);
-      }
-      if (msg.type === 'end') {
-        if (autoTimer) clearTimeout(autoTimer);
-        clientWs.close();
-      }
-    } catch (e) {
-      console.error('[mock] message error:', e.message);
-    }
-  });
 }
 
 module.exports = { handleInterviewSocket };
